@@ -4,6 +4,7 @@ const STATUS_COLORS = {
   active: ['#e6fcf5', '#087f5b'],
   authenticated: ['#e7f5ff', '#1971c2'],
   pending: ['#fff9db', '#e67700'],
+  past_due: ['#fff9db', '#e67700'],
   halted: ['#fff5f5', '#c92a2a'],
   draft: ['#fff9db', '#e67700'],
 };
@@ -29,6 +30,19 @@ const tab = {
 };
 
 export const styles = {
+  account: {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: '4px 12px',
+    fontSize: 13,
+    color: '#495057',
+    marginBottom: 8,
+  },
+  textBtn: { background: 'none', border: 0, padding: 0, color: BRAND, fontSize: 'inherit', cursor: 'pointer' },
+  authCard: { border: '1px solid #dee2e6', borderRadius: 12, padding: 24, maxWidth: 420, margin: '0 auto' },
+  stack: { display: 'flex', flexDirection: 'column', gap: 12, marginTop: 16 },
   page: { fontFamily: 'system-ui, sans-serif', maxWidth: 720, margin: '32px auto', padding: '0 16px', color: '#212529' },
   tabs: { display: 'flex', gap: 4, borderBottom: '1px solid #dee2e6', marginBottom: 24 },
   tab: (on) => (on ? { ...tab, boxShadow: `inset 0 -2px 0 ${BRAND}`, color: BRAND, fontWeight: 600 } : tab),

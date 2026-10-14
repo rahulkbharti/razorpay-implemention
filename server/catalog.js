@@ -3,7 +3,7 @@ import { query, tx } from './db.js';
 import { HttpError } from './util.js';
 
 // One product for now. Serving several SaaS products later means passing this in per request.
-let productId;
+export let productId;
 export async function initCatalog() {
   const { rows } = await query("SELECT id FROM products WHERE key = 'default'");
   productId = rows[0].id;
@@ -333,12 +333,15 @@ export async function removePrice(priceId) {
   return getPlan(planId);
 }
 
-// A price that was never sold can just go. One with a Razorpay plan may have subscribers
-// paying it, so keep the row and only stop offering it.
-function retirePrice(client, price) {
-  return price.razorpay_plan_id
-    ? client.query('UPDATE plan_prices SET is_active = false WHERE id = $1', [price.id])
-    : client.query('DELETE FROM plan_prices WHERE id = $1', [price.id]);
+// A price that was never sold can just go. One that was (it has a Razorpay plan or a
+// subscription) may still have customers paying it, so keep the row and only stop offering it.
+async function retirePrice(client, price) {
+  const { rowCount } = await client.query(
+    `DELETE FROM plan_prices
+     WHERE id = $1 AND razorpay_plan_id IS NULL AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE price_id = $1)`,
+    [price.id]
+  );
+  if (!rowCount) await client.query('UPDATE plan_prices SET is_active = false WHERE id = $1', [price.id]);
 }
 
 /* ---------- Selling (used by the subscription flow) ---------- */
@@ -355,6 +358,7 @@ const toSellable = (r) =>
         amount: r.amount,
         currency: r.currency,
         razorpayPlanId: r.razorpay_plan_id,
+        planId: r.plan_id,
         planKey: r.plan_key,
         planName: r.plan_name,
         planVersion: r.plan_version,
@@ -367,15 +371,6 @@ export async function findSellablePrice(id) {
     `${PRICE_WITH_PLAN} WHERE pp.id = $1 AND p.product_id = $2 AND pp.is_active AND p.status = 'active'`,
     [id, productId]
   );
-  return toSellable(rows[0]);
-}
-
-/** The price a Razorpay subscription was made from, retired or not, or null. */
-export async function findPriceByRazorpayPlan(razorpayPlanId) {
-  const { rows } = await query(`${PRICE_WITH_PLAN} WHERE pp.razorpay_plan_id = $1 AND p.product_id = $2`, [
-    razorpayPlanId,
-    productId,
-  ]);
   return toSellable(rows[0]);
 }
 

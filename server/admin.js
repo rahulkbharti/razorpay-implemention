@@ -2,6 +2,7 @@
 // real user accounts with an admin role.
 import express from 'express';
 import * as catalog from './catalog.js';
+import { listTenants } from './billing.js';
 import { HttpError, safeEqual, toId } from './util.js';
 
 const KEY = /^[a-z][a-z0-9_]{0,62}$/;
@@ -115,6 +116,12 @@ export function adminRouter(adminToken) {
 
   router.delete('/prices/:id', async (req, res) => {
     res.json(await catalog.removePrice(id(req)));
+  });
+
+  /* ---------- Tenants ---------- */
+
+  router.get('/tenants', async (_req, res) => {
+    res.json(await listTenants());
   });
 
   return router;

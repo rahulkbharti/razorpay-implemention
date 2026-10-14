@@ -3,8 +3,9 @@ import { api } from './api.js';
 import { styles } from './styles.js';
 import AdminPlans from './AdminPlans.jsx';
 import AdminFeatures from './AdminFeatures.jsx';
+import AdminTenants from './AdminTenants.jsx';
 
-const SECTIONS = { plans: 'Plans', features: 'Features' };
+const SECTIONS = { plans: 'Plans', features: 'Features', tenants: 'Tenants' };
 
 // Until there are user accounts, the admin API is guarded by ADMIN_TOKEN from server/.env.
 // Kept for this tab session only.
@@ -30,6 +31,7 @@ export default function Admin() {
   const [section, setSection] = useState('plans');
   const [features, setFeatures] = useState(null);
   const [plans, setPlans] = useState(null);
+  const [tenants, setTenants] = useState(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState(null);
 
@@ -40,14 +42,16 @@ export default function Admin() {
     setToken(null);
     setFeatures(null);
     setPlans(null);
+    setTenants(null);
     setNotice(msg ? { ok: false, msg } : null);
   }, []);
 
   const reload = useCallback(async () => {
     try {
-      const [f, p] = await Promise.all([call('/features'), call('/plans')]);
+      const [f, p, t] = await Promise.all([call('/features'), call('/plans'), call('/tenants')]);
       setFeatures(f);
       setPlans(p);
+      setTenants(t);
     } catch (e) {
       if (e.status === 401 || e.status === 503) lock(e.message);
       else setNotice({ ok: false, msg: e.message });
@@ -118,12 +122,14 @@ export default function Admin() {
         </div>
       </div>
 
-      {!features || !plans ? (
+      {!features || !plans || !tenants ? (
         <p>Loading…</p>
       ) : section === 'plans' ? (
         <AdminPlans plans={plans} {...props} />
-      ) : (
+      ) : section === 'features' ? (
         <AdminFeatures {...props} />
+      ) : (
+        <AdminTenants tenants={tenants} />
       )}
 
       {notice && (

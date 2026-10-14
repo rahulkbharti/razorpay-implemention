@@ -4,58 +4,41 @@ import { openCheckout } from './useRazorpay.js';
 import { styles } from './styles.js';
 
 const PER = { monthly: 'month', yearly: 'year' };
-const LIVE = ['authenticated', 'active', 'pending']; // still billing, so no second subscription
+const LIVE = ['active', 'past_due']; // still billing, so no second subscription
 const INVOICE_STATUS = { paid: 'Paid', issued: 'Due', expired: 'Expired', cancelled: 'Cancelled' };
+const STATUS_LABEL = { past_due: 'past due' };
 
-const date = (unix) =>
-  unix ? new Date(unix * 1000).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
+const date = (value) =>
+  value ? new Date(value).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
 
-// No login in this demo, so the browser remembers its own subscription id.
-// In a real app the server finds the subscription from the logged-in user.
-const STORAGE_KEY = 'subscriptionId';
-function savedId() {
-  try {
-    return localStorage.getItem(STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-function saveId(id) {
-  try {
-    if (id) localStorage.setItem(STORAGE_KEY, id);
-    else localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    // storage blocked — the subscription still works, it just won't show after a reload
-  }
-}
-
-export default function Subscriptions({ config }) {
+export default function Subscriptions({ config, me, onChange }) {
   const [period, setPeriod] = useState('monthly');
   const [sub, setSub] = useState(null);
   const [busy, setBusy] = useState(null);
   const [result, setResult] = useState(null);
   const polls = useRef(0);
+  const canBill = me.tenant.role !== 'member';
 
-  const refresh = useCallback(async (id) => {
-    if (!id) return;
+  // The server re-reads it from Razorpay, so the plan in `me` may have changed too.
+  const refresh = useCallback(async () => {
     try {
-      setSub(await api(`/api/subscriptions/${id}`));
+      setSub((await api('/api/subscription')).subscription);
+      await onChange();
     } catch (e) {
-      if (e.status === 404 || e.status === 400) saveId(null); // stale id
-      else setResult({ ok: false, msg: e.message });
+      setResult({ ok: false, msg: e.message });
     }
-  }, []);
+  }, [onChange]);
 
   useEffect(() => {
-    refresh(savedId());
+    refresh();
   }, [refresh]);
 
-  // Right after Checkout the first charge may still be settling ('authenticated' → 'active').
+  // Right after Checkout the first charge may still be settling, so there's no period yet.
   useEffect(() => {
-    if (sub?.status !== 'authenticated' || polls.current >= 10) return;
+    if (sub?.status !== 'active' || sub.currentPeriodEnd || polls.current >= 10) return;
     const t = setTimeout(() => {
       polls.current += 1;
-      refresh(sub.id);
+      refresh();
     }, 3000);
     return () => clearTimeout(t);
   }, [sub, refresh]);
@@ -71,17 +54,17 @@ export default function Subscriptions({ config }) {
           subscription_id: s.subscriptionId, // no amount/order_id — Razorpay takes them from the plan
           name: 'My SaaS',
           description: `${s.name} — ${rupees(s.amount)} / ${PER[s.period]}`,
+          prefill: { name: me.user.name, email: me.user.email, contact: me.user.phone ?? undefined },
           theme: { color: '#3b5bdb' },
         },
         (msg) => setResult({ ok: false, msg })
       );
       if (!response) return; // closed without paying
 
-      const v = await api('/api/subscriptions/verify', response);
-      saveId(v.subscriptionId);
+      await api('/api/subscriptions/verify', response);
       polls.current = 0;
-      await refresh(v.subscriptionId);
-      setResult({ ok: true, msg: `Subscribed — ${v.subscriptionId}` });
+      await refresh();
+      setResult({ ok: true, msg: `Subscribed to ${s.name}` });
     } catch (e) {
       setResult({ ok: false, msg: e.message });
     } finally {
@@ -90,17 +73,18 @@ export default function Subscriptions({ config }) {
   }
 
   async function cancel() {
-    // Active: stop renewing but keep what they paid for. Anything else: end it now.
+    // Active: stop renewing but keep what they paid for. Past due: end it now.
     const atCycleEnd = sub.status === 'active';
     const question = atCycleEnd
-      ? `Cancel your subscription? You keep access until ${date(sub.currentEnd)}.`
-      : 'Cancel your subscription?';
+      ? `Cancel your subscription? You keep ${sub.name} until ${date(sub.currentPeriodEnd)}.`
+      : 'Cancel your subscription? The workspace goes back to the free plan now.';
     if (!window.confirm(question)) return;
 
     setBusy('cancel');
     setResult(null);
     try {
-      setSub(await api(`/api/subscriptions/${sub.id}/cancel`, { atCycleEnd }));
+      setSub((await api('/api/subscription/cancel', { atCycleEnd })).subscription);
+      await onChange();
     } catch (e) {
       setResult({ ok: false, msg: e.message });
     } finally {
@@ -108,13 +92,8 @@ export default function Subscriptions({ config }) {
     }
   }
 
-  function dismiss() {
-    saveId(null);
-    setSub(null);
-    setResult(null);
-  }
-
   const live = sub && LIVE.includes(sub.status);
+  const currentKey = me.plan?.key;
   // A plan with no prices is free and shows under both periods.
   const plans = config.plans
     .map((p) => ({ ...p, price: p.prices.find((pr) => pr.period === period) }))
@@ -122,7 +101,7 @@ export default function Subscriptions({ config }) {
 
   return (
     <>
-      {sub && <CurrentSubscription sub={sub} busy={!!busy} onCancel={cancel} onDismiss={dismiss} />}
+      {sub && <CurrentSubscription sub={sub} busy={!!busy} canBill={canBill} onCancel={cancel} />}
 
       <div style={styles.header}>
         <h1 style={{ margin: 0 }}>Choose a plan</h1>
@@ -137,7 +116,8 @@ export default function Subscriptions({ config }) {
 
       <div style={styles.grid}>
         {plans.map((p) => {
-          const disabled = !!busy || live || !p.price;
+          const current = p.key === currentKey;
+          const disabled = !!busy || live || !p.price || current || !canBill;
           return (
             <div key={p.key} style={styles.card}>
               <h2 style={{ margin: 0 }}>{p.name}</h2>
@@ -147,13 +127,7 @@ export default function Subscriptions({ config }) {
                 <span style={styles.per}> / {PER[period]}</span>
               </p>
               <button style={styles.btn(disabled)} disabled={disabled} onClick={() => subscribe(p.price.id)}>
-                {live && sub.planKey === p.key
-                  ? 'Current plan'
-                  : !p.price
-                    ? 'Free forever'
-                    : busy === p.price.id
-                      ? 'Processing…'
-                      : 'Subscribe'}
+                {current ? 'Current plan' : !p.price ? 'Free forever' : busy === p.price.id ? 'Processing…' : 'Subscribe'}
               </button>
               <ul style={styles.featureList}>
                 {p.features.map((f) => (
@@ -165,6 +139,7 @@ export default function Subscriptions({ config }) {
         })}
       </div>
 
+      {!canBill && <p style={styles.muted}>Only the workspace owner or an admin can change the plan.</p>}
       {result && <p style={styles.notice(result.ok)}>{result.msg}</p>}
     </>
   );
@@ -179,7 +154,7 @@ function Feature({ feature: f }) {
   );
 }
 
-function CurrentSubscription({ sub, busy, onCancel, onDismiss }) {
+function CurrentSubscription({ sub, busy, canBill, onCancel }) {
   const live = LIVE.includes(sub.status);
   // One invoice per billing cycle. An unpaid one only matters while the subscription is still billing.
   const payments = sub.payments.filter((p) => p.status === 'paid' || (live && p.status === 'issued'));
@@ -190,16 +165,13 @@ function CurrentSubscription({ sub, busy, onCancel, onDismiss }) {
           <strong>
             {sub.name} · {rupees(sub.amount)} / {PER[sub.period]}
           </strong>
-          <span style={styles.badge(sub.status)}>{sub.cancelScheduled ? 'cancelling' : sub.status}</span>
+          <span style={styles.badge(sub.cancelAtPeriodEnd ? 'cancelling' : sub.status)}>
+            {sub.cancelAtPeriodEnd ? 'cancelling' : (STATUS_LABEL[sub.status] ?? sub.status)}
+          </span>
         </div>
-        {live && !sub.cancelScheduled && (
+        {live && !sub.cancelAtPeriodEnd && canBill && (
           <button style={styles.linkBtn} disabled={busy} onClick={onCancel}>
             Cancel subscription
-          </button>
-        )}
-        {!live && (
-          <button style={{ ...styles.linkBtn, color: '#495057' }} onClick={onDismiss}>
-            Dismiss
           </button>
         )}
       </div>
@@ -236,20 +208,19 @@ function CurrentSubscription({ sub, busy, onCancel, onDismiss }) {
 
 function describe(sub) {
   switch (sub.status) {
-    case 'authenticated':
-      return 'Payment method authorised — the first charge is being processed…';
     case 'active':
-      return sub.cancelScheduled
-        ? `Cancelled — no more charges. Access until ${date(sub.currentEnd)}.`
-        : `Renews on ${date(sub.chargeAt)} for ${rupees(sub.amount)} · ${sub.paidCount} of ${sub.totalCount} payments made.`;
-    case 'pending':
-      return 'The last renewal failed. Razorpay is retrying the charge automatically.';
+      if (!sub.currentPeriodEnd) return 'Payment method authorised — the first charge is being processed…';
+      return sub.cancelAtPeriodEnd
+        ? `Cancelled — no more charges. ${sub.name} stays on until ${date(sub.currentPeriodEnd)}.`
+        : `Autopay renews it on ${date(sub.currentPeriodEnd)} for ${rupees(sub.amount)}.`;
+    case 'past_due':
+      return 'The last renewal failed. Razorpay is retrying the charge automatically; your features stay on meanwhile.';
     case 'halted':
-      return 'All renewal retries failed, so the subscription is halted. Subscribe again to continue.';
+      return 'Every renewal retry failed, so the workspace is back on the free plan. Subscribe again to continue.';
     case 'cancelled':
       return `Cancelled on ${date(sub.endedAt)}.`;
-    case 'completed':
-      return `Completed — all ${sub.totalCount} payments made.`;
+    case 'expired':
+      return `Ended on ${date(sub.endedAt)}.`;
     default:
       return `Status: ${sub.status}`;
   }
