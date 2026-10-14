@@ -21,6 +21,22 @@ export async function tx(fn) {
   }
 }
 
+/** Runs fn unless another process holds the named lock (e.g. a second server running the same job). */
+export async function withLock(name, fn) {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query('SELECT pg_try_advisory_lock(hashtext($1)) AS ok', [name]);
+    if (!rows[0].ok) return null;
+    try {
+      return await fn();
+    } finally {
+      await client.query('SELECT pg_advisory_unlock(hashtext($1))', [name]);
+    }
+  } finally {
+    client.release();
+  }
+}
+
 // Applies each file in migrations/ once, in name order. To change the schema, add a new
 // numbered file — never edit one that has already run, because it won't run again.
 export async function migrate() {

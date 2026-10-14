@@ -1,17 +1,28 @@
 // A workspace's plan and subscription. Our subscriptions table is the source of truth for
-// access; for autopay, Razorpay webhooks keep it in sync with Razorpay's subscription.
+// access, whichever way the money is collected:
+//   auto:   a Razorpay Subscription (mandate); Razorpay webhooks keep our row in sync
+//   manual: the customer pays each period themselves (see manual.js)
 import express from 'express';
 import { query } from './db.js';
 import { findSellablePrice, listFeatures, productId, resolveEntitlements, saveRazorpayPlanId } from './catalog.js';
 import { requireRole, requireUser } from './auth.js';
 import { razorpay, signedByRazorpay } from './razorpay.js';
+import {
+  GRACE_DAYS,
+  applyInvoicePayment,
+  openFirstInvoice,
+  runBillingJob,
+  syncOpenLinks,
+  voidOpenInvoices,
+  voidTenantInvoices,
+} from './manual.js';
 import { HttpError, toId } from './util.js';
 
 // How many times an autopay subscription charges before it completes (10 years ≈ "until cancelled").
 const TOTAL_COUNT = { monthly: 120, yearly: 10 };
 
 // Razorpay's subscription status → ours. 'authenticated' means the mandate is set up and the
-// first charge is settling, which is enough to give access.
+// first charge is settling (or, with a trial, scheduled for when the trial ends).
 const FROM_RAZORPAY = {
   created: 'incomplete',
   authenticated: 'active',
@@ -25,18 +36,19 @@ const FROM_RAZORPAY = {
 };
 
 // Statuses that give the workspace its plan's features. Anything else means the default (free) plan.
-const ACCESS = ['active', 'past_due'];
+const ACCESS = ['trialing', 'active', 'past_due'];
+const IN_ACCESS = `('trialing', 'active', 'past_due')`;
 
 /* ---------- Current plan ---------- */
 
-/** The plan a workspace's features come from: its paid plan version, or the product's default plan. */
+/** The plan a workspace's features come from: its paid (or trial) plan version, or the product's default plan. */
 export async function currentPlan(tenantId) {
   const [features, { rows }] = await Promise.all([
     listFeatures(),
     query(
       `SELECT p.key, p.name, p.version, p.entitlements, true AS paid
        FROM subscriptions s JOIN plans p ON p.id = s.plan_id
-       WHERE s.tenant_id = $1 AND s.status IN ('active', 'past_due')
+       WHERE s.tenant_id = $1 AND s.status IN ${IN_ACCESS}
        UNION ALL
        SELECT p.key, p.name, p.version, p.entitlements, false
        FROM plans p JOIN products pr ON pr.id = p.product_id AND p.key = pr.default_plan_key
@@ -57,6 +69,15 @@ export async function currentPlan(tenantId) {
   };
 }
 
+// One free trial per workspace. A checkout that was never finished doesn't use it up.
+async function trialUsed(tenantId) {
+  const { rows } = await query(
+    `SELECT 1 FROM subscriptions WHERE tenant_id = $1 AND trial_end IS NOT NULL AND status <> 'incomplete'`,
+    [tenantId]
+  );
+  return rows.length > 0;
+}
+
 /* ---------- Subscriptions ---------- */
 
 const SUBSCRIPTION = `
@@ -71,17 +92,35 @@ async function getSubscription(id) {
 }
 
 async function liveSubscription(tenantId) {
-  const { rows } = await query(`${SUBSCRIPTION} WHERE s.tenant_id = $1 AND s.status IN ('active', 'past_due')`, [
-    tenantId,
-  ]);
+  const { rows } = await query(`${SUBSCRIPTION} WHERE s.tenant_id = $1 AND s.status IN ${IN_ACCESS}`, [tenantId]);
   return rows[0] ?? null;
 }
 
-// Shape a subscription (+ its invoices, one per billing cycle) for the client.
+// Shape a subscription and its payment history for the client. Autopay invoices live in
+// Razorpay (one per billing cycle); manual ones are ours.
 async function subscriptionView(s) {
-  const { items: invoices } = s.razorpay_subscription_id
-    ? await razorpay.invoices.all({ subscription_id: s.razorpay_subscription_id })
-    : { items: [] };
+  const payments = s.razorpay_subscription_id
+    ? (await razorpay.invoices.all({ subscription_id: s.razorpay_subscription_id })).items.map((inv) => ({
+        invoiceId: inv.id,
+        paymentId: inv.payment_id,
+        amount: inv.amount,
+        status: inv.status,
+        date: fromUnix(inv.paid_at ?? inv.billing_start ?? inv.created_at),
+      }))
+    : (
+        await query(
+          `SELECT * FROM invoices WHERE subscription_id = $1 AND status <> 'void' ORDER BY period_start DESC`,
+          [s.id]
+        )
+      ).rows.map((inv) => ({
+        invoiceId: inv.id,
+        paymentId: inv.razorpay_payment_id,
+        amount: inv.amount,
+        status: inv.status === 'open' ? 'issued' : inv.status,
+        date: inv.paid_at ?? inv.due_at,
+        dueAt: inv.due_at,
+        payUrl: inv.status === 'open' ? inv.payment_link_url : null,
+      }));
 
   return {
     id: s.id,
@@ -92,16 +131,17 @@ async function subscriptionView(s) {
     planVersion: s.plan_version,
     period: s.period,
     amount: s.amount,
+    trialEnd: s.trial_end,
     currentPeriodEnd: s.current_period_end,
+    graceEndsAt:
+      s.status === 'past_due' && s.collection_method === 'manual'
+        ? new Date(new Date(s.current_period_end).getTime() + GRACE_DAYS * 86400_000)
+        : null,
     cancelAtPeriodEnd: s.cancel_at_period_end,
     endedAt: s.ended_at,
-    payments: invoices.map((inv) => ({
-      invoiceId: inv.id,
-      paymentId: inv.payment_id,
-      amount: inv.amount,
-      status: inv.status,
-      date: fromUnix(inv.paid_at ?? inv.billing_start ?? inv.created_at),
-    })),
+    // The renewal the customer can pay right now (manual), from the reminder link.
+    openInvoice: payments.find((p) => p.payUrl) ?? null,
+    payments,
   };
 }
 
@@ -113,8 +153,8 @@ const razorpayError = (fallback) => (err) => {
   throw new HttpError(502, err?.error?.description || fallback);
 };
 
-// Each price gets its own Razorpay plan the first time someone subscribes to it. Razorpay
-// plans can't be edited, which is why a price row never changes once it has one.
+// Each price gets its own Razorpay plan the first time someone subscribes to it with autopay.
+// Razorpay plans can't be edited, which is why a price row never changes once it has one.
 async function razorpayPlanFor(price) {
   if (price.razorpayPlanId) return price.razorpayPlanId;
   const plan = await razorpay.plans.create({
@@ -128,15 +168,20 @@ async function razorpayPlanFor(price) {
   return saveRazorpayPlanId(price.id, plan.id);
 }
 
-// Before a new subscription starts, cancel the workspace's unfinished checkouts and halted
-// autopay subscriptions at Razorpay, so none of them can come back to life next to it.
+// Before a new subscription starts, clear out the workspace's unfinished checkouts, halted
+// autopay subscriptions and unpaid invoices (e.g. the late-payment link of an expired manual
+// subscription), so none of them can come back to life next to it. Razorpay orders can't be
+// cancelled, so if the customer still pays a voided one, applyInvoicePayment records the money
+// and flags it if it can't be applied.
 async function clearStale(tenantId) {
+  await voidTenantInvoices(tenantId);
   const { rows } = await query(
-    `SELECT id, status, razorpay_subscription_id FROM subscriptions
+    `SELECT id, status, collection_method, razorpay_subscription_id FROM subscriptions
      WHERE tenant_id = $1 AND status IN ('incomplete', 'halted')`,
     [tenantId]
   );
   for (const s of rows) {
+    if (s.collection_method === 'manual') continue; // nothing at Razorpay; its invoice was voided above
     const cancelled = await razorpay.subscriptions.cancel(s.razorpay_subscription_id, false).then(
       () => true,
       (err) => {
@@ -162,14 +207,14 @@ async function applyRazorpaySubscription(sub) {
   try {
     await query(
       `UPDATE subscriptions
-       SET status = $2,
+       SET status = CASE WHEN $7 = 'authenticated' AND trial_end > now() THEN 'trialing' ELSE $2 END,
            current_period_start = COALESCE(to_timestamp($3), current_period_start),
            current_period_end = COALESCE(to_timestamp($4), current_period_end),
            ended_at = CASE WHEN $5 THEN COALESCE(ended_at, to_timestamp($6), now()) END,
            cancel_at_period_end = cancel_at_period_end AND NOT $5,
            updated_at = now()
        WHERE razorpay_subscription_id = $1`,
-      [sub.id, status, sub.current_start ?? null, sub.current_end ?? null, ended, sub.ended_at ?? null]
+      [sub.id, status, sub.current_start ?? null, sub.current_end ?? null, ended, sub.ended_at ?? null, sub.status]
     );
   } catch (err) {
     if (err.code !== '23505') throw err;
@@ -199,7 +244,7 @@ export async function listTenants() {
   const { rows } = await query(
     `SELECT t.id, t.name, t.created_at, o.email, o.phone,
             s.status, s.collection_method, s.current_period_end, s.cancel_at_period_end,
-            CASE WHEN s.status IN ('active', 'past_due') THEN p.key || ' v' || p.version
+            CASE WHEN s.status IN ${IN_ACCESS} THEN p.key || ' v' || p.version
                  ELSE (SELECT default_plan_key FROM products WHERE id = $1) END AS plan
      FROM tenants t
      LEFT JOIN LATERAL (
@@ -237,7 +282,8 @@ export function billingRouter() {
   const router = express.Router();
 
   router.get('/me', requireUser, async (req, res) => {
-    res.json({ user: req.user, tenant: req.tenant, plan: await currentPlan(req.tenant.id) });
+    const [plan, usedTrial] = await Promise.all([currentPlan(req.tenant.id), trialUsed(req.tenant.id)]);
+    res.json({ user: req.user, tenant: req.tenant, plan, trialAvailable: !usedTrial });
   });
 
   // The workspace's latest subscription, live or ended (null if it never had one).
@@ -247,52 +293,81 @@ export function billingRouter() {
       [req.tenant.id]
     );
     let s = rows[0];
-    // Webhooks are how we normally hear about renewals and cancellations; re-reading here keeps
-    // this right when they're late or not set up at all (e.g. running locally without a tunnel).
+    // Webhooks are how we normally hear about payments, renewals and cancellations; re-reading
+    // here keeps this right when they're late or not set up at all (e.g. locally without a tunnel).
     if (s?.razorpay_subscription_id && !['cancelled', 'expired'].includes(s.status)) {
       await applyRazorpaySubscription(
         await razorpay.subscriptions.fetch(s.razorpay_subscription_id).catch(razorpayError('Could not fetch subscription'))
       );
-      s = await getSubscription(s.id);
+    } else if (s?.collection_method === 'manual') {
+      await syncOpenLinks(s.id).catch(razorpayError('Could not check the payment link'));
     }
+    if (s) s = await getSubscription(s.id);
     res.json({ subscription: s ? await subscriptionView(s) : null });
   });
 
-  // Autopay. Flow: create a Razorpay subscription → Checkout with its id (the customer authorises
-  // the mandate and pays the first cycle) → verify → Razorpay charges every later cycle itself.
+  // Starts a subscription. method 'auto' (default): Razorpay Subscription → Checkout authorises the
+  // mandate (and pays the first cycle unless there's a trial). method 'manual': a trial starts right
+  // away, or the first period is paid in Checkout with an order.
   router.post('/subscriptions', requireUser, requireRole('owner', 'admin'), async (req, res) => {
     const priceId = toId(req.body?.priceId);
+    const method = req.body?.method === 'manual' ? 'manual' : 'auto';
     const price = priceId && (await findSellablePrice(priceId));
     if (!price) throw new HttpError(400, 'Unknown plan');
-    if (await liveSubscription(req.tenant.id)) {
+    const tenantId = req.tenant.id;
+    if (await liveSubscription(tenantId)) {
       throw new HttpError(409, 'This workspace already has an active subscription — cancel it first');
     }
-    await clearStale(req.tenant.id);
+    const trialDays = price.trialDays > 0 && !(await trialUsed(tenantId)) ? price.trialDays : 0;
+    await clearStale(tenantId);
+    const summary = { method, name: price.planName, amount: price.amount, currency: price.currency, period: price.period, trialDays };
 
-    const planId = await razorpayPlanFor(price).catch(razorpayError('Could not create the Razorpay plan'));
-    const sub = await razorpay.subscriptions
-      .create({
-        plan_id: planId,
-        total_count: TOTAL_COUNT[price.period],
-        customer_notify: 1, // Razorpay emails/SMSes the customer about charges
-        notes: { tenantId: String(req.tenant.id), priceId: String(price.id), planKey: price.planKey },
-      })
-      .catch(razorpayError('Could not create subscription'));
+    if (method === 'auto') {
+      const planId = await razorpayPlanFor(price).catch(razorpayError('Could not create the Razorpay plan'));
+      const sub = await razorpay.subscriptions
+        .create({
+          plan_id: planId,
+          total_count: TOTAL_COUNT[price.period],
+          customer_notify: 1, // Razorpay emails/SMSes the customer about charges
+          // With a trial, the mandate is set up now and the first charge happens when the trial ends.
+          ...(trialDays && { start_at: Math.floor(Date.now() / 1000) + trialDays * 86400 }),
+          notes: { tenantId: String(tenantId), priceId: String(price.id), planKey: price.planKey },
+        })
+        .catch(razorpayError('Could not create subscription'));
+      await query(
+        `INSERT INTO subscriptions (tenant_id, plan_id, price_id, collection_method, razorpay_subscription_id, trial_end, current_period_end)
+         VALUES ($1, $2, $3, 'auto', $4, $5, $5)`,
+        [tenantId, price.planId, price.id, sub.id, trialDays ? new Date(Date.now() + trialDays * 86400_000) : null]
+      );
+      return res.json({ ...summary, subscriptionId: sub.id });
+    }
 
-    await query(
-      `INSERT INTO subscriptions (tenant_id, plan_id, price_id, collection_method, razorpay_subscription_id)
-       VALUES ($1, $2, $3, 'auto', $4)`,
-      [req.tenant.id, price.planId, price.id, sub.id]
+    if (trialDays) {
+      // No payment details needed. The billing job opens the first invoice before the trial ends.
+      await query(
+        `INSERT INTO subscriptions (tenant_id, plan_id, price_id, collection_method, status, trial_end, current_period_start, current_period_end)
+         VALUES ($1, $2, $3, 'manual', 'trialing', now() + make_interval(days => $4), now(), now() + make_interval(days => $4))`,
+        [tenantId, price.planId, price.id, trialDays]
+      );
+      runBillingJob().catch((err) => console.error('[billing] job failed:', err)); // a short trial is due soon
+      return res.json(summary);
+    }
+
+    const { rows } = await query(
+      `INSERT INTO subscriptions (tenant_id, plan_id, price_id, collection_method) VALUES ($1, $2, $3, 'manual') RETURNING id`,
+      [tenantId, price.planId, price.id]
     );
-    res.json({ subscriptionId: sub.id, name: price.planName, amount: price.amount, period: price.period });
+    const invoice = await openFirstInvoice(rows[0].id).catch(razorpayError('Could not create the order'));
+    res.json({ ...summary, invoiceId: invoice.id, orderId: invoice.razorpay_order_id });
   });
 
+  // Autopay: after Checkout authorises the mandate.
   router.post('/subscriptions/verify', requireUser, async (req, res) => {
     const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature } = req.body ?? {};
     if (!razorpay_payment_id || !razorpay_subscription_id || !razorpay_signature) {
       throw new HttpError(400, 'Missing fields');
     }
-    // Note the order: payment_id|subscription_id (one-time orders sign order_id|payment_id).
+    // Note the order: payment_id|subscription_id (orders sign order_id|payment_id).
     if (!signedByRazorpay(`${razorpay_payment_id}|${razorpay_subscription_id}`, razorpay_signature)) {
       throw new HttpError(400, 'Invalid signature');
     }
@@ -306,24 +381,64 @@ export function billingRouter() {
       .fetch(razorpay_subscription_id)
       .catch(razorpayError('Could not fetch subscription'));
     await applyRazorpaySubscription(sub);
-    const status = FROM_RAZORPAY[sub.status];
+    const { status } = await getSubscription(rows[0].id);
     if (!ACCESS.includes(status)) throw new HttpError(400, `Subscription is ${sub.status}`);
+    res.json({ verified: true, status });
+  });
+
+  // Manual: after Checkout pays the first invoice's order.
+  router.post('/invoices/:id/verify', requireUser, async (req, res) => {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body ?? {};
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) throw new HttpError(400, 'Missing fields');
+    if (!signedByRazorpay(`${razorpay_order_id}|${razorpay_payment_id}`, razorpay_signature)) {
+      throw new HttpError(400, 'Invalid signature');
+    }
+    const { rows } = await query('SELECT * FROM invoices WHERE id = $1 AND tenant_id = $2 AND razorpay_order_id = $3', [
+      toId(req.params.id),
+      req.tenant.id,
+      razorpay_order_id,
+    ]);
+    const invoice = rows[0];
+    if (!invoice) throw new HttpError(404, 'Invoice not found');
+
+    // Straight from Razorpay: right order, right amount, money actually taken.
+    const payment = await razorpay.payments.fetch(razorpay_payment_id).catch(razorpayError('Could not fetch payment'));
+    if (
+      payment.order_id !== razorpay_order_id ||
+      payment.amount !== invoice.amount ||
+      !['authorized', 'captured'].includes(payment.status)
+    ) {
+      throw new HttpError(400, 'Payment mismatch');
+    }
+    await applyInvoicePayment(invoice.id, { paymentId: payment.id, amount: payment.amount });
+    const { status } = await getSubscription(invoice.subscription_id);
     res.json({ verified: true, status });
   });
 
   router.post('/subscription/cancel', requireUser, requireRole('owner', 'admin'), async (req, res) => {
     const live = await liveSubscription(req.tenant.id);
     if (!live) throw new HttpError(404, 'No active subscription to cancel');
-    // true: stop renewing but keep access until the paid period ends. false: end it now.
+    // true: stop renewing but keep access until the paid period (or trial) ends. false: end it now.
     const atCycleEnd = Boolean(req.body?.atCycleEnd);
 
-    const sub = await razorpay.subscriptions
-      .cancel(live.razorpay_subscription_id, atCycleEnd)
-      .catch(razorpayError('Could not cancel subscription'));
-    // Razorpay keeps the status 'active' until the cycle ends and has no field for
-    // "cancel scheduled", so remember it ourselves.
-    if (atCycleEnd) await query('UPDATE subscriptions SET cancel_at_period_end = true WHERE id = $1', [live.id]);
-    await applyRazorpaySubscription(sub);
+    if (live.collection_method === 'manual') {
+      // Nothing to cancel at Razorpay; just stop billing. The job ends it when the period runs out.
+      await voidOpenInvoices(live.id);
+      await query(
+        atCycleEnd
+          ? `UPDATE subscriptions SET cancel_at_period_end = true, updated_at = now() WHERE id = $1`
+          : `UPDATE subscriptions SET status = 'cancelled', ended_at = now(), updated_at = now() WHERE id = $1`,
+        [live.id]
+      );
+    } else {
+      const sub = await razorpay.subscriptions
+        .cancel(live.razorpay_subscription_id, atCycleEnd)
+        .catch(razorpayError('Could not cancel subscription'));
+      // Razorpay keeps the status 'active' until the cycle ends and has no field for
+      // "cancel scheduled", so remember it ourselves.
+      if (atCycleEnd) await query('UPDATE subscriptions SET cancel_at_period_end = true WHERE id = $1', [live.id]);
+      await applyRazorpaySubscription(sub);
+    }
     res.json({ subscription: await subscriptionView(await getSubscription(live.id)) });
   });
 

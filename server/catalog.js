@@ -142,6 +142,7 @@ const toPlan = (r) => ({
   entitlements: r.entitlements,
   isPublic: r.is_public,
   sortOrder: r.sort_order,
+  trialDays: r.trial_days,
   publishedAt: r.published_at,
   prices: r.prices.map(toPrice),
 });
@@ -182,27 +183,29 @@ export async function listPublicPlans() {
     key: r.key,
     name: r.name,
     description: r.description,
+    trialDays: r.trial_days,
     prices: r.prices.map(({ id, period, amount, currency }) => ({ id, period, amount, currency })),
     features: resolveEntitlements(r.entitlements, features),
   }));
 }
 
 /** Creates version 1 of a new plan, as a draft. */
-export async function createPlan({ key, name, description, isPublic, sortOrder, entitlements = {} }) {
+export async function createPlan({ key, name, description, isPublic, sortOrder, trialDays, entitlements = {} }) {
   const normalized = normalizeEntitlements(entitlements, await listFeatures());
   const { rows } = await query(
-    `INSERT INTO plans (product_id, key, version, name, description, is_public, sort_order, entitlements)
+    `INSERT INTO plans (product_id, key, version, name, description, is_public, sort_order, trial_days, entitlements)
      VALUES ($1, $2, 1, $3, $4, $5,
-             COALESCE($6, (SELECT COALESCE(max(sort_order), 0) + 1 FROM plans WHERE product_id = $1)), $7)
+             COALESCE($6, (SELECT COALESCE(max(sort_order), 0) + 1 FROM plans WHERE product_id = $1)), $7, $8)
      RETURNING id`,
-    [productId, key, name, description ?? '', isPublic ?? true, sortOrder ?? null, JSON.stringify(normalized)]
+    [productId, key, name, description ?? '', isPublic ?? true, sortOrder ?? null, trialDays ?? 0, JSON.stringify(normalized)]
   );
   return getPlan(rows[0].id);
 }
 
-// Name, description and visibility can change on any version. Entitlements only on a
-// draft: a published version is what its customers paid for.
-export async function updatePlan(id, { name, description, isPublic, sortOrder, entitlements }) {
+// Name, description, visibility and trial length can change on any version (they only affect
+// people who subscribe later). Entitlements only on a draft: a published version is what its
+// customers paid for.
+export async function updatePlan(id, { name, description, isPublic, sortOrder, trialDays, entitlements }) {
   const features = entitlements === undefined ? null : await listFeatures();
   await tx(async (c) => {
     const plan = await lockPlan(c, id);
@@ -216,9 +219,10 @@ export async function updatePlan(id, { name, description, isPublic, sortOrder, e
     await c.query(
       `UPDATE plans
        SET name = COALESCE($2, name), description = COALESCE($3, description), is_public = COALESCE($4, is_public),
-           sort_order = COALESCE($5, sort_order), entitlements = COALESCE($6::jsonb, entitlements)
+           sort_order = COALESCE($5, sort_order), entitlements = COALESCE($6::jsonb, entitlements),
+           trial_days = COALESCE($7, trial_days)
        WHERE id = $1`,
-      [id, name ?? null, description ?? null, isPublic ?? null, sortOrder ?? null, normalized]
+      [id, name ?? null, description ?? null, isPublic ?? null, sortOrder ?? null, normalized, trialDays ?? null]
     );
   });
   return getPlan(id);
@@ -269,9 +273,9 @@ export async function newPlanVersion(id) {
     if (drafts[0]) throw new HttpError(409, `${source.key} v${drafts[0].version} is already a draft — edit that one`);
 
     const { rows } = await c.query(
-      `INSERT INTO plans (product_id, key, version, name, description, entitlements, is_public, sort_order)
+      `INSERT INTO plans (product_id, key, version, name, description, entitlements, is_public, sort_order, trial_days)
        SELECT product_id, key, (SELECT max(version) + 1 FROM plans WHERE product_id = $2 AND key = $3),
-              name, description, entitlements, is_public, sort_order
+              name, description, entitlements, is_public, sort_order, trial_days
        FROM plans WHERE id = $1
        RETURNING id`,
       [id, productId, source.key]
@@ -347,7 +351,7 @@ async function retirePrice(client, price) {
 /* ---------- Selling (used by the subscription flow) ---------- */
 
 const PRICE_WITH_PLAN = `
-  SELECT pp.*, p.key AS plan_key, p.name AS plan_name, p.version AS plan_version
+  SELECT pp.*, p.key AS plan_key, p.name AS plan_name, p.version AS plan_version, p.trial_days
   FROM plan_prices pp JOIN plans p ON p.id = pp.plan_id`;
 
 const toSellable = (r) =>
@@ -362,6 +366,7 @@ const toSellable = (r) =>
         planKey: r.plan_key,
         planName: r.plan_name,
         planVersion: r.plan_version,
+        trialDays: r.trial_days,
       }
     : null;
 

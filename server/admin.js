@@ -3,6 +3,7 @@
 import express from 'express';
 import * as catalog from './catalog.js';
 import { listTenants } from './billing.js';
+import { runBillingJob } from './manual.js';
 import { HttpError, safeEqual, toId } from './util.js';
 
 const KEY = /^[a-z][a-z0-9_]{0,62}$/;
@@ -68,6 +69,7 @@ export function adminRouter(adminToken) {
       description: text(b.description, 'description', { blank: true, max: 500 }),
       isPublic: bool(b.isPublic, 'isPublic'),
       sortOrder: int(b.sortOrder, 'sortOrder'),
+      trialDays: trialDays(b.trialDays),
       entitlements: b.entitlements,
     });
     res.status(201).json(plan);
@@ -81,6 +83,7 @@ export function adminRouter(adminToken) {
         description: text(b.description, 'description', { blank: true, max: 500 }),
         isPublic: bool(b.isPublic, 'isPublic'),
         sortOrder: int(b.sortOrder, 'sortOrder'),
+        trialDays: trialDays(b.trialDays),
         entitlements: b.entitlements,
       })
     );
@@ -124,6 +127,11 @@ export function adminRouter(adminToken) {
     res.json(await listTenants());
   });
 
+  // Runs the hourly billing job now (renewal invoices, reminders, grace period, expiry).
+  router.post('/jobs/billing', async (_req, res) => {
+    res.json(await runBillingJob());
+  });
+
   return router;
 }
 
@@ -151,6 +159,12 @@ function text(value, field, { required = false, blank = false, max = 100 } = {})
 function int(value, field) {
   if (value === undefined) return undefined;
   if (!Number.isInteger(value) || Math.abs(value) > 1_000_000) throw new HttpError(400, `${field} must be a whole number`);
+  return value;
+}
+
+function trialDays(value) {
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || value < 0 || value > 365) throw new HttpError(400, 'trialDays must be 0–365');
   return value;
 }
 

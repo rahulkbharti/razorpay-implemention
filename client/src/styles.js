@@ -7,6 +7,7 @@ const STATUS_COLORS = {
   past_due: ['#fff9db', '#e67700'],
   halted: ['#fff5f5', '#c92a2a'],
   draft: ['#fff9db', '#e67700'],
+  trialing: ['#f3f0ff', '#6741d9'],
 };
 const GRAY = ['#f1f3f5', '#495057'];
 
@@ -39,6 +40,15 @@ export const styles = {
     fontSize: 13,
     color: '#495057',
     marginBottom: 8,
+  },
+  payBtn: {
+    display: 'inline-block',
+    padding: '10px 18px',
+    borderRadius: 8,
+    background: BRAND,
+    color: '#fff',
+    fontSize: 15,
+    textDecoration: 'none',
   },
   textBtn: { background: 'none', border: 0, padding: 0, color: BRAND, fontSize: 'inherit', cursor: 'pointer' },
   authCard: { border: '1px solid #dee2e6', borderRadius: 12, padding: 24, maxWidth: 420, margin: '0 auto' },

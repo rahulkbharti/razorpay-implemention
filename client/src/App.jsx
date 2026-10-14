@@ -3,11 +3,10 @@ import { api } from './api.js';
 import { loadRazorpay } from './useRazorpay.js';
 import { styles } from './styles.js';
 import Auth from './Auth.jsx';
-import OneTime from './OneTime.jsx';
 import Subscriptions from './Subscriptions.jsx';
 import Admin from './Admin.jsx';
 
-const TABS = { subscriptions: 'Subscriptions', 'one-time': 'One-time', admin: 'Admin' };
+const TABS = { subscriptions: 'Pricing & billing', admin: 'Admin' };
 
 export default function App() {
   const [config, setConfig] = useState(null);
@@ -74,13 +73,7 @@ export default function App() {
           {(!config || me === undefined) && !error && <p>Loading…</p>}
           {config &&
             me !== undefined &&
-            (tab === 'one-time' ? (
-              <OneTime config={config} />
-            ) : me ? (
-              <Subscriptions config={config} me={me} onChange={loadMe} />
-            ) : (
-              <Auth onDone={loadMe} />
-            ))}
+            (me ? <Subscriptions config={config} me={me} onChange={loadMe} /> : <Auth onDone={loadMe} />)}
         </>
       )}
     </main>

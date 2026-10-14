@@ -129,7 +129,7 @@ export default function Admin() {
       ) : section === 'features' ? (
         <AdminFeatures {...props} />
       ) : (
-        <AdminTenants tenants={tenants} />
+        <AdminTenants tenants={tenants} {...props} />
       )}
 
       {notice && (

@@ -125,7 +125,12 @@ function PlanEditor({ plan, versions, features, call, run, busy, onSelect }) {
   const live = versions.find((v) => v.status === 'active');
   const hasDraft = versions.some((v) => v.status === 'draft');
 
-  const [details, setDetails] = useState({ name: plan.name, description: plan.description, isPublic: plan.isPublic });
+  const [details, setDetails] = useState({
+    name: plan.name,
+    description: plan.description,
+    isPublic: plan.isPublic,
+    trialDays: plan.trialDays,
+  });
   const [values, setValues] = useState(() =>
     Object.fromEntries(
       features.map((f) => [
@@ -243,6 +248,19 @@ function PlanEditor({ plan, versions, features, call, run, busy, onSelect }) {
               style={styles.input}
               value={details.description}
               onChange={(e) => setDetails((d) => ({ ...d, description: e.target.value }))}
+            />
+          </label>
+          <label style={styles.field}>
+            Free trial (days)
+            <input
+              type="number"
+              min="0"
+              max="365"
+              style={{ ...styles.input, width: 90 }}
+              value={details.trialDays}
+              onChange={(e) =>
+                setDetails((d) => ({ ...d, trialDays: Math.min(365, Math.max(0, Math.floor(Number(e.target.value)) || 0)) }))
+              }
             />
           </label>
           <label style={{ ...styles.check, paddingBottom: 8 }}>
