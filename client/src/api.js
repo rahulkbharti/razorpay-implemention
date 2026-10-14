@@ -1,9 +1,11 @@
 export const rupees = (paise) => `₹${(paise / 100).toLocaleString('en-IN')}`;
 
-export async function api(path, body) {
+export const formatLimit = (value) => (value === -1 ? 'Unlimited' : value.toLocaleString('en-IN'));
+
+export async function api(path, body, { method = body ? 'POST' : 'GET', token } = {}) {
   const res = await fetch(path, {
-    method: body ? 'POST' : 'GET',
-    headers: { 'Content-Type': 'application/json' },
+    method,
+    headers: { 'Content-Type': 'application/json', ...(token && { Authorization: `Bearer ${token}` }) },
     body: body ? JSON.stringify(body) : undefined,
   });
   // When the API is down, the Vite proxy answers 502 with an empty (non-JSON) body.

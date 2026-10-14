@@ -4,8 +4,9 @@ import { loadRazorpay } from './useRazorpay.js';
 import { styles } from './styles.js';
 import OneTime from './OneTime.jsx';
 import Subscriptions from './Subscriptions.jsx';
+import Admin from './Admin.jsx';
 
-const TABS = { subscriptions: 'Subscriptions', 'one-time': 'One-time' };
+const TABS = { subscriptions: 'Subscriptions', 'one-time': 'One-time', admin: 'Admin' };
 
 export default function App() {
   const [config, setConfig] = useState(null);
@@ -13,9 +14,19 @@ export default function App() {
   const [tab, setTab] = useState('subscriptions');
 
   useEffect(() => {
-    api('/api/config').then(setConfig).catch((e) => setError(e.message));
     loadRazorpay().catch(() => {}); // preload
   }, []);
+
+  // Reload on every tab switch so plan changes made in Admin show up straight away.
+  useEffect(() => {
+    if (tab === 'admin') return;
+    api('/api/config')
+      .then((c) => {
+        setConfig(c);
+        setError(null);
+      })
+      .catch((e) => setError(e.message));
+  }, [tab]);
 
   return (
     <main style={styles.page}>
@@ -27,9 +38,15 @@ export default function App() {
         ))}
       </nav>
 
-      {error && <p style={styles.notice(false)}>{error}</p>}
-      {!config && !error && <p>Loading…</p>}
-      {config && (tab === 'subscriptions' ? <Subscriptions config={config} /> : <OneTime config={config} />)}
+      {tab === 'admin' ? (
+        <Admin />
+      ) : (
+        <>
+          {error && <p style={styles.notice(false)}>{error}</p>}
+          {!config && !error && <p>Loading…</p>}
+          {config && (tab === 'subscriptions' ? <Subscriptions config={config} /> : <OneTime config={config} />)}
+        </>
+      )}
     </main>
   );
 }

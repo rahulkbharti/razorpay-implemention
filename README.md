@@ -8,12 +8,33 @@
    signature (`order_id|payment_id` signed with your key secret) and re-fetches the payment from Razorpay.
 5. Webhook `POST /api/webhooks/razorpay` is the source of truth for fulfilment (covers closed tabs, network drops).
 
-## Subscriptions (recurring payments)
-Plans live in `PLANS` in `server/index.js` (Basic/Pro, monthly/yearly). On the first subscribe the
-server creates them in Razorpay, tagged with `notes.key`, and reuses them after that. Razorpay plans
-can't be edited, so changing a price creates a new plan and existing subscribers stay on the old one.
+## Plans & features (entitlements)
+Plans, what they include and what they cost live in PostgreSQL and are managed from the **Admin** tab
+(`server/catalog.js`, schema in `server/migrations/001_catalog.sql`).
 
-1. React calls `POST /api/subscriptions` with a `planKey`; the server creates a subscription
+- **Feature catalog** (`features`): every feature a plan can grant. `boolean` features are on/off;
+  `limit` features are a whole number, with `-1` for unlimited. Plans can only use keys from the
+  catalog, so a typo is rejected instead of silently granting nothing. Add a feature and it shows up
+  in every plan editor.
+- **Plans** (`plans`) store what they grant as JSON, validated against the catalog:
+  ```json
+  { "features": { "custom_domain": true }, "limits": { "projects": 10, "team_members": 5 } }
+  ```
+  Only what the plan grants is stored: a missing key means off / 0 (deny by default).
+- **Versions**: a plan starts as a `draft` that you can edit freely. Publishing makes it `active`
+  (what new customers buy) and locks its features. To change them, create a new version and publish
+  it: the old version becomes `archived` but keeps applying to the customers already on it.
+- **Prices** (`plan_prices`) belong to a plan version, one per period (monthly / yearly). A plan with
+  no prices is free. Each price becomes a Razorpay plan on its first subscribe. Razorpay plans can't be
+  edited, so setting a new price retires the old row, and existing subscribers keep paying the old amount.
+- Everything carries a `product_id` (one `default` product for now), so the same tables can later
+  serve several SaaS products.
+
+The admin API (`/api/admin/*`, `server/admin.js`) is guarded by `ADMIN_TOKEN` until there are user
+accounts. `GET /api/config` returns the live version of each public plan, with every feature resolved.
+
+## Subscriptions (recurring payments)
+1. React calls `POST /api/subscriptions` with a `priceId`; the server creates a subscription
    (`total_count` = max number of charges) and returns its `subscription_id`.
 2. React opens Checkout with `subscription_id` (no amount or order). The customer authorises a
    mandate (card / UPI Autopay / e-mandate) and pays the first cycle.
@@ -32,11 +53,14 @@ The demo has no login, so the browser stores its subscription id in `localStorag
 
 ## Run
 ```bash
+# database (once) — any PostgreSQL works; on Windows psql is in C:\Program Files\PostgreSQL\<version>in
+psql -U postgres -c "CREATE DATABASE saas;"
+
 # backend
 cd server
-cp .env.example .env      # put your keys in .env
+cp .env.example .env      # put your keys, DATABASE_URL and ADMIN_TOKEN in .env
 npm install
-npm run dev               # http://localhost:5000
+npm run dev               # http://localhost:5000 — creates the tables and starter plans on first run
 
 # frontend (new terminal)
 cd client
@@ -62,7 +86,7 @@ and subscribe to `payment.captured`, `payment.failed`, `order.paid`, and for sub
 `subscription.halted`, `subscription.cancelled`, `subscription.completed`.
 
 ## Production checklist
-- Replace the in-memory `orders` / `subscriptions` Maps with a database.
+- Move the in-memory `orders` / `subscriptions` Maps into the database.
 - Tie each subscription to a logged-in user; only let that user view or cancel it (the demo trusts the id).
 - Make webhook handling idempotent (store processed event/payment ids) — `subscription.charged` can be redelivered.
 - Plan upgrades/downgrades: `razorpay.subscriptions.update(id, { plan_id, schedule_change_at })`.

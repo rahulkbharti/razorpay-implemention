@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, rupees } from './api.js';
+import { api, formatLimit, rupees } from './api.js';
 import { openCheckout } from './useRazorpay.js';
 import { styles } from './styles.js';
 
@@ -60,11 +60,11 @@ export default function Subscriptions({ config }) {
     return () => clearTimeout(t);
   }, [sub, refresh]);
 
-  async function subscribe(planKey) {
-    setBusy(planKey);
+  async function subscribe(priceId) {
+    setBusy(priceId);
     setResult(null);
     try {
-      const s = await api('/api/subscriptions', { planKey });
+      const s = await api('/api/subscriptions', { priceId });
       const response = await openCheckout(
         {
           key: config.keyId,
@@ -115,7 +115,10 @@ export default function Subscriptions({ config }) {
   }
 
   const live = sub && LIVE.includes(sub.status);
-  const plans = Object.entries(config.plans).filter(([, p]) => p.period === period);
+  // A plan with no prices is free and shows under both periods.
+  const plans = config.plans
+    .map((p) => ({ ...p, price: p.prices.find((pr) => pr.period === period) }))
+    .filter((p) => p.price || p.prices.length === 0);
 
   return (
     <>
@@ -133,18 +136,30 @@ export default function Subscriptions({ config }) {
       </div>
 
       <div style={styles.grid}>
-        {plans.map(([key, p]) => {
-          const disabled = !!busy || live;
+        {plans.map((p) => {
+          const disabled = !!busy || live || !p.price;
           return (
-            <div key={key} style={styles.card}>
+            <div key={p.key} style={styles.card}>
               <h2 style={{ margin: 0 }}>{p.name}</h2>
+              {p.description && <p style={styles.muted}>{p.description}</p>}
               <p style={styles.price}>
-                {rupees(p.amount)}
-                <span style={styles.per}> / {PER[p.period]}</span>
+                {p.price ? rupees(p.price.amount) : '₹0'}
+                <span style={styles.per}> / {PER[period]}</span>
               </p>
-              <button style={styles.btn(disabled)} disabled={disabled} onClick={() => subscribe(key)}>
-                {live && sub.planKey === key ? 'Current plan' : busy === key ? 'Processing…' : 'Subscribe'}
+              <button style={styles.btn(disabled)} disabled={disabled} onClick={() => subscribe(p.price.id)}>
+                {live && sub.planKey === p.key
+                  ? 'Current plan'
+                  : !p.price
+                    ? 'Free forever'
+                    : busy === p.price.id
+                      ? 'Processing…'
+                      : 'Subscribe'}
               </button>
+              <ul style={styles.featureList}>
+                {p.features.map((f) => (
+                  <Feature key={f.key} feature={f} />
+                ))}
+              </ul>
             </div>
           );
         })}
@@ -152,6 +167,15 @@ export default function Subscriptions({ config }) {
 
       {result && <p style={styles.notice(result.ok)}>{result.msg}</p>}
     </>
+  );
+}
+
+function Feature({ feature: f }) {
+  const on = f.type === 'boolean' ? f.value : f.value !== 0;
+  return (
+    <li style={styles.feature(on)}>
+      {on ? '✓' : '✕'} {f.type === 'limit' ? `${f.name}: ${formatLimit(f.value)}` : f.name}
+    </li>
   );
 }
 

@@ -3,6 +3,16 @@ import crypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import Razorpay from 'razorpay';
+import { migrate } from './db.js';
+import {
+  initCatalog,
+  listPublicPlans,
+  findSellablePrice,
+  findPriceByRazorpayPlan,
+  saveRazorpayPlanId,
+} from './catalog.js';
+import { adminRouter } from './admin.js';
+import { safeEqual, toId } from './util.js';
 
 const {
   PORT = 5000,
@@ -10,10 +20,16 @@ const {
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
   RAZORPAY_WEBHOOK_SECRET,
+  DATABASE_URL,
+  ADMIN_TOKEN,
 } = process.env;
 
 if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
   console.error('Missing RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET in .env');
+  process.exit(1);
+}
+if (!DATABASE_URL) {
+  console.error('Missing DATABASE_URL in .env');
   process.exit(1);
 }
 
@@ -26,51 +42,30 @@ const PRODUCTS = {
   pro: { name: 'Pro Plan', amount: 99900 },
 };
 
-// Recurring plans. totalCount = how many times the customer is charged before the
-// subscription completes (120 months / 10 years ≈ "until cancelled").
-const PLANS = {
-  basic_monthly: { name: 'Basic', period: 'monthly', amount: 49900, totalCount: 120 },
-  pro_monthly: { name: 'Pro', period: 'monthly', amount: 99900, totalCount: 120 },
-  basic_yearly: { name: 'Basic', period: 'yearly', amount: 499000, totalCount: 10 },
-  pro_yearly: { name: 'Pro', period: 'yearly', amount: 999000, totalCount: 10 },
-};
+// Plans, their features and their prices live in the database (see catalog.js) and are
+// managed from the Admin tab.
+
+// How many times a subscription charges before it completes (10 years ≈ "until cancelled").
+const TOTAL_COUNT = { monthly: 120, yearly: 10 };
 
 // Replace with your database (orders table keyed by razorpay order id).
 const orders = new Map();
 // Replace with your database (subscriptions table, linked to your user).
 const subscriptions = new Map();
 
-// Razorpay plans can't be edited or deleted, so instead of creating one per restart we
-// tag each with notes.key and reuse the one whose key, price and period still match.
-// Changing a price in PLANS creates a new plan; existing subscribers stay on the old one.
-let planIds;
-function getPlanId(key) {
-  planIds ??= syncPlans().catch((err) => {
-    planIds = undefined; // retry on the next request
-    throw err;
+// Each price gets its own Razorpay plan the first time someone subscribes to it. Razorpay
+// plans can't be edited, which is why a price row never changes once it has one.
+async function razorpayPlanFor(price) {
+  if (price.razorpayPlanId) return price.razorpayPlanId;
+  const plan = await razorpay.plans.create({
+    period: price.period,
+    interval: 1,
+    item: { name: `${price.planName} v${price.planVersion} (${price.period})`, amount: price.amount, currency: price.currency },
+    notes: { priceId: String(price.id), planKey: price.planKey },
   });
-  return planIds.then((ids) => ids[key]);
-}
-
-async function syncPlans() {
-  const { items } = await razorpay.plans.all({ count: 100 });
-  const ids = {};
-  for (const [key, p] of Object.entries(PLANS)) {
-    const existing = items.find(
-      (rp) => rp.notes?.key === key && rp.item.amount === p.amount && rp.period === p.period && rp.interval === 1
-    );
-    ids[key] =
-      existing?.id ??
-      (
-        await razorpay.plans.create({
-          period: p.period,
-          interval: 1,
-          item: { name: `${p.name} (${p.period})`, amount: p.amount, currency: 'INR' },
-          notes: { key },
-        })
-      ).id;
-  }
-  return ids;
+  // Two first subscribes at the same moment can both get here; the first save wins and
+  // the other Razorpay plan is never used.
+  return saveRazorpayPlanId(price.id, plan.id);
 }
 
 const app = express();
@@ -133,9 +128,11 @@ function onSubscriptionEvent(name, payload) {
 app.use(express.json());
 
 /* ---------- Public config ---------- */
-app.get('/api/config', (_req, res) => {
-  res.json({ keyId: RAZORPAY_KEY_ID, products: PRODUCTS, plans: PLANS });
+app.get('/api/config', async (_req, res) => {
+  res.json({ keyId: RAZORPAY_KEY_ID, products: PRODUCTS, plans: await listPublicPlans() });
 });
+
+app.use('/api/admin', adminRouter(ADMIN_TOKEN));
 
 /* ---------- 1. Create order ---------- */
 app.post('/api/orders', async (req, res) => {
@@ -213,20 +210,20 @@ app.post('/api/payments/verify', async (req, res) => {
 const SUB_ID = /^sub_[A-Za-z0-9]+$/; // ids go into Razorpay API URLs, so only allow real ones
 
 app.post('/api/subscriptions', async (req, res) => {
-  const planKey = req.body?.planKey;
-  const plan = PLANS[planKey];
-  if (!plan) return res.status(400).json({ error: 'Unknown plan' });
+  const priceId = toId(req.body?.priceId);
+  const price = priceId && (await findSellablePrice(priceId));
+  if (!price) return res.status(400).json({ error: 'Unknown plan' });
 
   try {
     const sub = await razorpay.subscriptions.create({
-      plan_id: await getPlanId(planKey),
-      total_count: plan.totalCount,
+      plan_id: await razorpayPlanFor(price),
+      total_count: TOTAL_COUNT[price.period],
       customer_notify: 1, // Razorpay emails/SMSes the customer about charges
-      notes: { planKey },
+      notes: { planKey: price.planKey, priceId: String(price.id) },
     });
 
-    subscriptions.set(sub.id, { planKey, status: sub.status });
-    res.json({ subscriptionId: sub.id, name: plan.name, amount: plan.amount, period: plan.period });
+    subscriptions.set(sub.id, { planKey: price.planKey, status: sub.status });
+    res.json({ subscriptionId: sub.id, name: price.planName, amount: price.amount, period: price.period });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err?.error?.description || 'Could not create subscription' });
@@ -251,13 +248,14 @@ app.post('/api/subscriptions/verify', async (req, res) => {
 
   try {
     const sub = await razorpay.subscriptions.fetch(razorpay_subscription_id);
-    const planKey = sub.notes?.planKey;
+    const price = await findPriceByRazorpayPlan(sub.plan_id);
+    if (!price) return res.status(400).json({ verified: false, error: 'Subscription is not for one of our plans' });
     // 'authenticated' = mandate set up, first charge still settling; 'active' = charged.
-    if (!PLANS[planKey] || !['authenticated', 'active'].includes(sub.status)) {
+    if (!['authenticated', 'active'].includes(sub.status)) {
       return res.status(400).json({ verified: false, error: `Subscription is ${sub.status}` });
     }
 
-    subscriptions.set(sub.id, { ...subscriptions.get(sub.id), planKey, status: sub.status });
+    subscriptions.set(sub.id, { ...subscriptions.get(sub.id), planKey: price.planKey, status: sub.status });
     res.json({ verified: true, subscriptionId: sub.id, status: sub.status });
   } catch (err) {
     console.error(err);
@@ -297,17 +295,19 @@ app.post('/api/subscriptions/:id/cancel', async (req, res) => {
 
 // Shape a Razorpay subscription (+ its invoices, one per billing cycle) for the client.
 async function subscriptionView(sub) {
-  const planKey = sub.notes?.planKey;
-  const plan = PLANS[planKey] ?? {};
-  const { items: invoices } = await razorpay.invoices.all({ subscription_id: sub.id });
+  const [price, { items: invoices }] = await Promise.all([
+    priceOf(sub),
+    razorpay.invoices.all({ subscription_id: sub.id }),
+  ]);
 
   return {
     id: sub.id,
     status: sub.status,
-    planKey,
-    name: plan.name,
-    period: plan.period,
-    amount: plan.amount,
+    planKey: price.planKey,
+    priceId: price.id,
+    name: price.planName,
+    period: price.period,
+    amount: price.amount,
     paidCount: sub.paid_count,
     totalCount: sub.total_count,
     currentEnd: sub.current_end,
@@ -324,10 +324,31 @@ async function subscriptionView(sub) {
   };
 }
 
-function safeEqual(a, b) {
-  const ba = Buffer.from(a);
-  const bb = Buffer.from(String(b));
-  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+// Subscriptions made before plans moved into the database have no price row, so fall back
+// to what Razorpay has on record for their plan.
+async function priceOf(sub) {
+  const price = await findPriceByRazorpayPlan(sub.plan_id);
+  if (price) return price;
+  const plan = await razorpay.plans.fetch(sub.plan_id);
+  return { id: null, planKey: sub.notes?.planKey, planName: plan.item.name, period: plan.period, amount: plan.item.amount };
+}
+
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
+
+// Express 5 passes errors thrown in async handlers here.
+app.use((err, _req, res, _next) => {
+  if (err.code === '23505') return res.status(409).json({ error: 'That key is already taken' }); // unique violation
+  const status = err.status ?? 500; // HttpError, or a 400 from express.json for a malformed body
+  if (status >= 500) console.error(err);
+  res.status(status).json({ error: status < 500 ? err.message : 'Something went wrong' });
+});
+
+try {
+  await migrate();
+  await initCatalog();
+} catch (err) {
+  console.error('Could not set up the database:', err.message);
+  process.exit(1);
 }
 
 app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
