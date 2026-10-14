@@ -19,3 +19,17 @@ export function loadRazorpay() {
   });
   return loader;
 }
+
+/**
+ * Opens Checkout. Resolves with the success response (to send to the server for
+ * verification), or with null if the customer closes it without paying.
+ */
+export async function openCheckout(options, onFailedAttempt) {
+  const Razorpay = await loadRazorpay();
+  return new Promise((resolve) => {
+    const rzp = new Razorpay({ ...options, handler: resolve, modal: { ondismiss: () => resolve(null) } });
+    // Checkout stays open after a failed attempt so the customer can retry — keep waiting.
+    rzp.on('payment.failed', (r) => onFailedAttempt?.(r.error?.description || 'Payment failed'));
+    rzp.open();
+  });
+}
