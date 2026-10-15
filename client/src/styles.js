@@ -10,6 +10,7 @@ const STATUS_COLORS = {
   trialing: ['#f3f0ff', '#6741d9'],
 };
 const GRAY = ['#f1f3f5', '#495057'];
+const METER_COLORS = { ok: BRAND, full: '#e67700', over: '#c92a2a' };
 
 const smallBtn = {
   padding: '7px 12px',
@@ -96,6 +97,37 @@ export const styles = {
   table: { width: '100%', borderCollapse: 'collapse', fontSize: 14 },
   th: { textAlign: 'left', padding: '6px 8px', borderBottom: '1px solid #dee2e6', color: '#868e96', fontWeight: 500 },
   td: { padding: '6px 8px', borderBottom: '1px solid #f1f3f5', whiteSpace: 'nowrap' },
+  // Workspace
+  list: { listStyle: 'none', padding: 0, margin: 0 },
+  listRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 12,
+    flexWrap: 'wrap',
+    padding: '8px 0',
+    borderBottom: '1px solid #f1f3f5',
+    fontSize: 14,
+  },
+  meterHead: { display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 14, marginBottom: 4 },
+  meterTrack: { height: 8, borderRadius: 999, background: '#f1f3f5', overflow: 'hidden' },
+  meterFill: (percent, level) => ({ width: `${percent}%`, height: '100%', background: METER_COLORS[level] }),
+  meterText: (level) => (level === 'ok' ? undefined : { color: METER_COLORS[level], fontWeight: 600 }),
+  locked: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 12,
+    flexWrap: 'wrap',
+    marginTop: 12,
+    padding: 12,
+    borderRadius: 8,
+    background: '#f8f9fa',
+    border: '1px dashed #ced4da',
+    fontSize: 14,
+    color: '#495057',
+  },
+
   // Admin
   section: { margin: '28px 0 12px', fontSize: 16 },
   form: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' },

@@ -9,6 +9,8 @@ import { adminRouter } from './admin.js';
 import { authRouter, loadSession } from './auth.js';
 import { billingRouter, syncRazorpaySubscription } from './billing.js';
 import { payInvoiceByLink, payInvoiceByOrder, runBillingJob } from './manual.js';
+import { entitlementsRouter } from './entitlements.js';
+import { workspaceRouter } from './workspace.js';
 import { HttpError, safeEqual } from './util.js';
 
 const {
@@ -84,6 +86,8 @@ app.get('/api/config', async (_req, res) => {
 app.use('/api/auth', authRouter());
 app.use('/api/admin', adminRouter(ADMIN_TOKEN));
 app.use('/api', billingRouter());
+app.use('/api', entitlementsRouter());
+app.use('/api', workspaceRouter());
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
 
@@ -93,7 +97,7 @@ app.use((err, _req, res, _next) => {
   const status = err.status ?? 500; // HttpError, or a 400 from express.json for a malformed body
   const expose = err instanceof HttpError || status < 500;
   if (!expose) console.error(err);
-  res.status(status).json({ error: expose ? err.message : 'Something went wrong' });
+  res.status(status).json(expose ? { error: err.message, ...err.details } : { error: 'Something went wrong' });
 });
 
 try {

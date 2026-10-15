@@ -11,6 +11,7 @@ export async function api(path, body, { method = body ? 'POST' : 'GET', token } 
   // When the API is down, the Vite proxy answers 502 with an empty (non-JSON) body.
   const data = await res.json().catch(() => null);
   if (!data) throw new Error(`Server error (${res.status}) — is the API running on port 5000?`);
-  if (!res.ok) throw Object.assign(new Error(data.error || 'Request failed'), { status: res.status });
+  // `data` carries extra details, e.g. { code: 'limit_reached', limit, used } when a plan limit blocks it.
+  if (!res.ok) throw Object.assign(new Error(data.error || 'Request failed'), { status: res.status, data });
   return data;
 }

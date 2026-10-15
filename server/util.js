@@ -1,10 +1,11 @@
 import crypto from 'node:crypto';
 
-/** An error whose message is safe to show the client. */
+/** An error whose message (and details, e.g. a machine-readable code) is safe to show the client. */
 export class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, details) {
     super(message);
     this.status = status;
+    this.details = details;
   }
 }
 

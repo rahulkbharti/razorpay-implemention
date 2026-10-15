@@ -92,6 +92,40 @@ No mandate: the customer pays each period themselves. Each period is an `invoice
 The **billing job** runs every hour (`runBillingJob`, guarded by a Postgres advisory lock so two servers
 don't run it at once) and is safe to run any time. Admin → Tenants → **Run billing job now** runs it on demand.
 
+## Enforcing plans (entitlements)
+`server/entitlements.js` answers "may this workspace do this?" from the plan its features come from
+(its paid or trial plan version, else the free plan). The server enforces it for every gated action;
+the client only uses it to show or hide things.
+
+```js
+// An on/off feature: 403 unless the plan has it.
+router.put('/workspace/domain', requireUser, requireFeature('custom_domain'), handler);
+
+// A limit: counts and creates in one transaction, under a per-workspace lock, so two requests at
+// once can't both slip under the limit.
+registerUsage('projects', (db, tenantId) => /* SELECT count(*) ... */);
+await withinLimit(req, 'projects', (c) => c.query('INSERT INTO projects ...'));
+
+// Anything else: const ent = await entitlementsFor(req); ent.can('sso'); ent.limit('projects');
+```
+
+- Anything the plan doesn't grant is denied, including keys that aren't in the catalog. A key that
+  isn't there (a typo in the code) is logged once, so it doesn't fail silently.
+- A refusal is a `403` the client can act on:
+  `{ error, code: 'limit_reached', feature, limit, used, upgradeTo: { key, name } }` or
+  `{ error, code: 'feature_not_in_plan', feature, upgradeTo }`. `upgradeTo` is the first paid public
+  plan that would allow it.
+- **Downgrades never delete anything.** Over a limit, existing items stay and only adding more is
+  blocked. A feature that's turned off stops working, but its settings are kept (a saved custom domain
+  is marked inactive), so everything works again after an upgrade. Removing things is always allowed.
+- Customers keep the plan version they bought: publishing a new version with lower limits only
+  affects new subscribers.
+- `GET /api/me/entitlements` returns `{ plan, features: { key: bool }, limits: { key: { name, limit, used } } }`
+  for the UI. `used` is `null` for a limit nothing counts yet (API calls, until usage metering).
+
+The **Workspace** tab is a small demo of the product itself (`server/workspace.js`): projects count
+against the `projects` limit, and a custom domain needs the `custom_domain` feature.
+
 ## Run
 ```bash
 # database (once) — any PostgreSQL works; on Windows psql is in C:\Program Files\PostgreSQL\<version>\bin

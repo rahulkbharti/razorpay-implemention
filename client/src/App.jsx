@@ -4,15 +4,16 @@ import { loadRazorpay } from './useRazorpay.js';
 import { styles } from './styles.js';
 import Auth from './Auth.jsx';
 import Subscriptions from './Subscriptions.jsx';
+import Workspace from './Workspace.jsx';
 import Admin from './Admin.jsx';
 
-const TABS = { subscriptions: 'Pricing & billing', admin: 'Admin' };
+const TABS = { workspace: 'Workspace', subscriptions: 'Pricing & billing', admin: 'Admin' };
 
 export default function App() {
   const [config, setConfig] = useState(null);
   const [me, setMe] = useState(undefined); // undefined while loading, null when logged out
   const [error, setError] = useState(null);
-  const [tab, setTab] = useState('subscriptions');
+  const [tab, setTab] = useState('workspace');
 
   // The logged-in user, their workspace and the plan its features come from.
   const loadMe = useCallback(
@@ -73,7 +74,13 @@ export default function App() {
           {(!config || me === undefined) && !error && <p>Loading…</p>}
           {config &&
             me !== undefined &&
-            (me ? <Subscriptions config={config} me={me} onChange={loadMe} /> : <Auth onDone={loadMe} />)}
+            (!me ? (
+              <Auth onDone={loadMe} />
+            ) : tab === 'workspace' ? (
+              <Workspace config={config} me={me} onUpgrade={() => setTab('subscriptions')} />
+            ) : (
+              <Subscriptions config={config} me={me} onChange={loadMe} />
+            ))}
         </>
       )}
     </main>
