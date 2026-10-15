@@ -102,6 +102,23 @@ export default function Subscriptions({ config, me, onChange }) {
     });
   }
 
+  // Razorpay can't change the plan of a UPI Autopay, so such a change comes back as a new mandate
+  // to approve (with the prorated difference as an upfront amount, for an upgrade). Returns false
+  // if the customer closed Checkout: then nothing has changed.
+  async function approveMandate(m) {
+    const autopay = `autopay ${rupees(m.amount)} / ${PER[m.period]} from ${date(m.startsAt)}`;
+    const response = await openCheckout(
+      {
+        ...checkoutOptions(m.upfront > 0 ? `Pay ${rupees(m.upfront)} now, then ${autopay}` : `New ${autopay}`),
+        subscription_id: m.subscriptionId,
+      },
+      onFailedAttempt
+    );
+    if (!response) return false;
+    await api('/api/subscription/mandate/verify', response);
+    return true;
+  }
+
   // Changing plans: the server says what it would cost and when, the customer confirms.
   function previewChange(priceId) {
     run(priceId, async () => {
@@ -111,10 +128,15 @@ export default function Subscriptions({ config, me, onChange }) {
   }
 
   function confirmChange() {
-    const { priceId, plan, at } = preview;
+    const { priceId, plan, at, when } = preview;
+    const done = when === 'period_end' ? `Switching to ${plan.name} on ${date(at)}` : `You're now on ${plan.name}`;
     run('change', async () => {
       const r = await api('/api/subscription/change', { priceId });
       setPreview(null);
+      if (r.mandate) {
+        if (!(await approveMandate(r.mandate))) throw new Error(`Plan not changed — the new autopay wasn't approved.`);
+        return done;
+      }
       if (r.invoiceId) {
         const response = await openCheckout(
           {
@@ -136,13 +158,16 @@ export default function Subscriptions({ config, me, onChange }) {
         }
         await api(`/api/invoices/${r.invoiceId}/verify`, response);
       }
-      return r.scheduled ? `Switching to ${plan.name} on ${date(at)}` : `You're now on ${plan.name}`;
+      return done;
     });
   }
 
   function cancelChange() {
     run('cancel-change', async () => {
-      await api('/api/subscription/change/cancel', {});
+      const r = await api('/api/subscription/change/cancel', {});
+      if (r.mandate && !(await approveMandate(r.mandate))) {
+        throw new Error("Change not cancelled — the autopay for your current plan wasn't approved.");
+      }
       return 'Scheduled change cancelled';
     });
   }
@@ -306,6 +331,9 @@ function ChangePanel({ preview, sub, busy, onConfirm, onClose }) {
     <section ref={ref} style={{ ...styles.panel, marginBottom: 16 }}>
       <strong>Change to {plan.name}</strong>
       <p style={styles.muted}>{text}</p>
+      {sub.collectionMethod === 'auto' && (
+        <p style={styles.muted}>With UPI Autopay you'll approve the new amount in your UPI app; the old mandate is then stopped.</p>
+      )}
       {losing.features.length > 0 && <p style={styles.muted}>You'll lose: {losing.features.join(', ')}.</p>}
       {losing.limits.map((l) => (
         <p key={l.name} style={styles.muted}>

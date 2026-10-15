@@ -92,8 +92,14 @@ what the workspace would lose); `POST /api/subscription/change` does it.
   the billing job applies them when the period begins, and a manual renewal is invoiced at the new price.
   `POST /api/subscription/change/cancel` drops one.
 - Autopay: Razorpay is told first (`subscriptions.update` with `schedule_change_at: 'cycle_end'`), so if
-  it refuses (not every mandate can change amount) nothing has changed or been charged. The prorated
-  difference is our own order. Undoing a change re-schedules the plan the workspace is on, rather than
+  it fails nothing has changed or been charged. The prorated difference is our own order.
+- **UPI Autopay can't be updated** (Razorpay: "subscriptions cannot be updated when payment mode is upi").
+  Then the mandate is replaced: a new Razorpay subscription for the new plan, starting when the current
+  (paid) period or trial ends, with the prorated difference as an add-on, so the customer approves the
+  new amount and pays the difference in one Checkout. `POST /api/subscription/mandate/verify` checks it
+  replaces this workspace's current mandate (our `notes` on it say what it replaces and does), cancels the
+  old one and applies the change. If Razorpay won't cancel the old one, the new one is cancelled instead
+  and nothing changes, so two mandates never charge the same cycle. Closing Checkout changes nothing. Undoing a change re-schedules the plan the workspace is on, rather than
   just cancelling Razorpay's scheduled changes, because after a paid upgrade Razorpay's own plan is still
   the old one until the cycle ends. Autopay can't change period length: switch to manual first.
 - Past due: pay first. Cancelling: no changes.
@@ -235,8 +241,8 @@ subscriptions `subscription.authenticated`, `subscription.activated`, `subscript
 - Cache entitlements briefly (each API call reads the plan) once traffic grows.
 - Add-ons (e.g. "+5 members for ₹199/month"): recurring extras need a billing decision for autopay
   (Razorpay subscriptions have one fixed amount). Per-workspace overrides cover negotiated deals meanwhile.
-- Test plan changes on autopay against real Razorpay test mode, with both a card and a UPI mandate:
-  Razorpay may refuse to update some mandates, and the app then asks the customer to switch to manual.
+- Test plan changes on autopay against real Razorpay test mode, with both a card and a UPI mandate. For
+  UPI, check that Checkout charges the upgrade's add-on when the new mandate is approved.
 - Watch the logs for `refund it by hand`: a payment that arrived for a checkout the customer had
   already replaced (e.g. paid in two tabs). The money is recorded on the invoice but not applied.
 - Set `CLIENT_ORIGIN` to the real app URL: payment links send the customer back there after paying.
