@@ -20,6 +20,7 @@ export default function Subscriptions({ config, me, onChange }) {
   const [period, setPeriod] = useState('monthly');
   const [method, setMethod] = useState('auto');
   const [sub, setSub] = useState(null);
+  const [preview, setPreview] = useState(null); // a plan change waiting for confirmation
   const [busy, setBusy] = useState(null);
   const [result, setResult] = useState(null);
   const polls = useRef(0);
@@ -49,25 +50,42 @@ export default function Subscriptions({ config, me, onChange }) {
     return () => clearTimeout(t);
   }, [sub, refresh]);
 
-  async function subscribe(priceId) {
-    setBusy(priceId);
+  const checkoutOptions = (description) => ({
+    key: config.keyId,
+    name: 'My SaaS',
+    description,
+    prefill: { name: me.user.name, email: me.user.email, contact: me.user.phone ?? undefined },
+    theme: { color: '#3b5bdb' },
+  });
+  const onFailedAttempt = (msg) => setResult({ ok: false, msg });
+
+  // Runs a billing action: busy flag, then a success notice (and a refresh) when it returns a message.
+  async function run(key, fn) {
+    setBusy(key);
     setResult(null);
     try {
+      const msg = await fn();
+      if (msg) {
+        await refresh();
+        setResult({ ok: true, msg });
+      }
+    } catch (e) {
+      setResult({ ok: false, msg: e.message });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function subscribe(priceId) {
+    run(priceId, async () => {
       const s = await api('/api/subscriptions', { priceId, method });
-      const checkout = {
-        key: config.keyId,
-        name: 'My SaaS',
-        description: `${s.name} — ${rupees(s.amount)} / ${PER[s.period]}`,
-        prefill: { name: me.user.name, email: me.user.email, contact: me.user.phone ?? undefined },
-        theme: { color: '#3b5bdb' },
-      };
-      const onFailedAttempt = (msg) => setResult({ ok: false, msg });
+      const checkout = checkoutOptions(`${s.name} — ${rupees(s.amount)} / ${PER[s.period]}`);
 
       if (s.method === 'auto') {
         // No amount or order: Razorpay takes them from the plan. With a trial this only sets up the mandate.
         if (s.trialDays) checkout.description = `${s.trialDays}-day free trial, then ${checkout.description}`;
         const response = await openCheckout({ ...checkout, subscription_id: s.subscriptionId }, onFailedAttempt);
-        if (!response) return; // closed without finishing
+        if (!response) return null; // closed without finishing
         await api('/api/subscriptions/verify', response);
       } else if (s.orderId) {
         // Manual: pay the first period now.
@@ -75,19 +93,82 @@ export default function Subscriptions({ config, me, onChange }) {
           { ...checkout, order_id: s.orderId, amount: s.amount, currency: s.currency },
           onFailedAttempt
         );
-        if (!response) return;
+        if (!response) return null;
         await api(`/api/invoices/${s.invoiceId}/verify`, response);
       }
       // Otherwise it's a manual trial, which starts without paying anything.
-
       polls.current = 0;
-      await refresh();
-      setResult({ ok: true, msg: s.trialDays ? `Your ${s.trialDays}-day ${s.name} trial has started` : `Subscribed to ${s.name}` });
-    } catch (e) {
-      setResult({ ok: false, msg: e.message });
-    } finally {
-      setBusy(null);
+      return s.trialDays ? `Your ${s.trialDays}-day ${s.name} trial has started` : `Subscribed to ${s.name}`;
+    });
+  }
+
+  // Changing plans: the server says what it would cost and when, the customer confirms.
+  function previewChange(priceId) {
+    run(priceId, async () => {
+      setPreview({ priceId, ...(await api('/api/subscription/change/preview', { priceId })) });
+      return null;
+    });
+  }
+
+  function confirmChange() {
+    const { priceId, plan, at } = preview;
+    run('change', async () => {
+      const r = await api('/api/subscription/change', { priceId });
+      setPreview(null);
+      if (r.invoiceId) {
+        const response = await openCheckout(
+          {
+            ...checkoutOptions(`Upgrade to ${r.name} for the rest of this period`),
+            order_id: r.orderId,
+            amount: r.amount,
+            currency: r.currency,
+          },
+          onFailedAttempt
+        );
+        if (!response) {
+          await refresh();
+          // Autopay schedules the new plan at Razorpay before the charge, so it's on for the next cycle.
+          throw new Error(
+            sub.collectionMethod === 'auto'
+              ? `Upgrade not paid. ${r.name} is scheduled from your next renewal — cancel the change below if you don't want it.`
+              : `Upgrade not paid — you're still on ${sub.name}.`
+          );
+        }
+        await api(`/api/invoices/${r.invoiceId}/verify`, response);
+      }
+      return r.scheduled ? `Switching to ${plan.name} on ${date(at)}` : `You're now on ${plan.name}`;
+    });
+  }
+
+  function cancelChange() {
+    run('cancel-change', async () => {
+      await api('/api/subscription/change/cancel', {});
+      return 'Scheduled change cancelled';
+    });
+  }
+
+  function switchMethod(target) {
+    if (
+      target === 'manual' &&
+      !window.confirm(`Stop autopay? Nothing changes until ${date(sub.currentPeriodEnd)}; before then we'll send you a payment link instead.`)
+    ) {
+      return;
     }
+    run('method', async () => {
+      const r = await api('/api/subscription/method', { method: target });
+      if (target === 'manual') return "Autopay stopped. We'll send a payment link before your next renewal.";
+      // A mandate whose first charge is when the current (already paid) period ends.
+      const response = await openCheckout(
+        {
+          ...checkoutOptions(`Autopay from ${date(r.startsAt)}: ${rupees(r.amount)} / ${PER[r.period]}`),
+          subscription_id: r.subscriptionId,
+        },
+        onFailedAttempt
+      );
+      if (!response) throw new Error("Autopay wasn't set up — you're still on Pay each time.");
+      await api('/api/subscription/method/verify', response);
+      return `Autopay is on. The first charge is on ${date(r.startsAt)}.`;
+    });
   }
 
   async function cancel() {
@@ -98,20 +179,15 @@ export default function Subscriptions({ config, me, onChange }) {
       ? `Cancel your subscription? You keep ${sub.name} until ${date(sub.currentPeriodEnd)}.`
       : 'Cancel your subscription? The workspace goes back to the free plan now.';
     if (!window.confirm(question)) return;
-
-    setBusy('cancel');
-    setResult(null);
-    try {
+    run('cancel', async () => {
       setSub((await api('/api/subscription/cancel', { atCycleEnd })).subscription);
       await onChange();
-    } catch (e) {
-      setResult({ ok: false, msg: e.message });
-    } finally {
-      setBusy(null);
-    }
+      return null;
+    });
   }
 
   const live = sub && LIVE.includes(sub.status);
+  const canChange = live && canBill && sub.status !== 'past_due' && !sub.cancelAtPeriodEnd;
   const currentKey = me.plan?.key;
   // A plan with no prices is free and shows under both periods.
   const plans = config.plans
@@ -120,22 +196,60 @@ export default function Subscriptions({ config, me, onChange }) {
 
   return (
     <>
-      {sub && <CurrentSubscription sub={sub} busy={!!busy} canBill={canBill} onCancel={cancel} />}
+      {sub && (
+        <CurrentSubscription
+          sub={sub}
+          busy={!!busy}
+          canBill={canBill}
+          onCancel={cancel}
+          onCancelChange={cancelChange}
+          onSwitchMethod={switchMethod}
+        />
+      )}
 
       <div style={styles.header}>
-        <h1 style={{ margin: 0 }}>Choose a plan</h1>
+        <h1 style={{ margin: 0 }}>{live ? 'Change plan' : 'Choose a plan'}</h1>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <Toggle options={{ monthly: 'Monthly', yearly: 'Yearly' }} value={period} onChange={setPeriod} />
-          <Toggle options={METHODS} value={method} onChange={setMethod} />
+          {/* How a new subscription is paid. A live one switches from the panel above. */}
+          {!live && <Toggle options={METHODS} value={method} onChange={setMethod} />}
         </div>
       </div>
-      <p style={{ ...styles.muted, margin: '-4px 0 16px' }}>{METHOD_HELP[method]}</p>
+      {!live && <p style={{ ...styles.muted, margin: '-4px 0 16px' }}>{METHOD_HELP[method]}</p>}
+      {live && sub.status === 'past_due' && (
+        <p style={{ ...styles.muted, margin: '-4px 0 16px' }}>Pay the overdue invoice first, then you can change plans.</p>
+      )}
+
+      {preview && (
+        <ChangePanel preview={preview} sub={sub} busy={!!busy} onConfirm={confirmChange} onClose={() => setPreview(null)} />
+      )}
 
       <div style={styles.grid}>
         {plans.map((p) => {
-          const current = p.key === currentKey;
-          const trial = p.price && p.trialDays > 0 && me.trialAvailable ? p.trialDays : 0;
-          const disabled = !!busy || live || !p.price || current || !canBill;
+          const trial = !live && p.price && p.trialDays > 0 && me.trialAvailable ? p.trialDays : 0;
+          let label;
+          let disabled;
+          let onClick = () => subscribe(p.price.id);
+          if (!live) {
+            const current = p.key === currentKey;
+            disabled = !!busy || !p.price || current || !canBill;
+            label = current ? 'Current plan' : !p.price ? 'Free forever' : trial ? `Start ${trial}-day free trial` : 'Subscribe';
+          } else {
+            const current = p.price?.id === sub.priceId;
+            const scheduled = p.price && sub.pendingChange?.priceId === p.price.id;
+            disabled = !!busy || !canChange || !p.price || current || scheduled;
+            onClick = () => previewChange(p.price.id);
+            label = current
+              ? 'Current plan'
+              : !p.price
+                ? 'Free forever'
+                : scheduled
+                  ? 'Scheduled'
+                  : p.key === sub.planKey
+                    ? `Switch to ${period}`
+                    : `Switch to ${p.name}`;
+          }
+          if (p.price && busy === p.price.id) label = 'Processing…';
           return (
             <div key={p.key} style={styles.card}>
               <h2 style={{ margin: 0 }}>{p.name}</h2>
@@ -144,18 +258,10 @@ export default function Subscriptions({ config, me, onChange }) {
                 {p.price ? rupees(p.price.amount) : '₹0'}
                 <span style={styles.per}> / {PER[period]}</span>
               </p>
-              <button style={styles.btn(disabled)} disabled={disabled} onClick={() => subscribe(p.price.id)}>
-                {current
-                  ? 'Current plan'
-                  : !p.price
-                    ? 'Free forever'
-                    : busy === p.price.id
-                      ? 'Processing…'
-                      : trial
-                        ? `Start ${trial}-day free trial`
-                        : 'Subscribe'}
+              <button style={styles.btn(disabled)} disabled={disabled} onClick={onClick}>
+                {label}
               </button>
-              {trial > 0 && !current && (
+              {trial > 0 && (
                 <p style={{ ...styles.muted, fontSize: 13 }}>
                   {method === 'auto'
                     ? `Set up autopay now; the first charge is after ${trial} days.`
@@ -175,6 +281,47 @@ export default function Subscriptions({ config, me, onChange }) {
       {!canBill && <p style={styles.muted}>Only the workspace owner or an admin can change the plan.</p>}
       {result && <p style={styles.notice(result.ok)}>{result.msg}</p>}
     </>
+  );
+}
+
+function ChangePanel({ preview, sub, busy, onConfirm, onClose }) {
+  const ref = useRef(null);
+  // Braces matter: newer browsers return a promise from scrollIntoView, and React would call
+  // whatever an effect returns as its cleanup.
+  useEffect(() => {
+    ref.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [preview]);
+  const { plan, when, amount, at, losing } = preview;
+  const next = `${rupees(plan.amount)} / ${PER[plan.period]}`;
+  const text =
+    sub.status === 'trialing'
+      ? `Switch your trial to ${plan.name} now. Nothing to pay; after the trial it's ${next}.`
+      : when === 'period_end'
+        ? `Switch to ${plan.name} (${next}) on ${date(at)}. You keep ${sub.name} until then.`
+        : amount > 0
+          ? `Upgrade to ${plan.name} now: pay ${rupees(amount)} today for the rest of this period, then ${next}.`
+          : `Upgrade to ${plan.name} now. The difference for the days left is too small to charge; then ${next}.`;
+  const n = (x) => x.toLocaleString('en-IN');
+  return (
+    <section ref={ref} style={{ ...styles.panel, marginBottom: 16 }}>
+      <strong>Change to {plan.name}</strong>
+      <p style={styles.muted}>{text}</p>
+      {losing.features.length > 0 && <p style={styles.muted}>You'll lose: {losing.features.join(', ')}.</p>}
+      {losing.limits.map((l) => (
+        <p key={l.name} style={styles.muted}>
+          {l.name}: you're using {n(l.used)}, {plan.name} allows {formatLimit(l.limit)}. Nothing is deleted, but you can't
+          add more.
+        </p>
+      ))}
+      <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+        <button style={styles.primaryBtn} disabled={busy} onClick={onConfirm}>
+          {when === 'now' && amount > 0 ? `Pay ${rupees(amount)} and upgrade` : 'Confirm'}
+        </button>
+        <button style={styles.smallBtn} onClick={onClose}>
+          Keep {sub.name}
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -199,8 +346,9 @@ function Feature({ feature: f }) {
   );
 }
 
-function CurrentSubscription({ sub, busy, canBill, onCancel }) {
+function CurrentSubscription({ sub, busy, canBill, onCancel, onCancelChange, onSwitchMethod }) {
   const live = LIVE.includes(sub.status);
+  const otherMethod = sub.collectionMethod === 'auto' ? 'manual' : 'auto';
   // An unpaid invoice only matters while the subscription is still billing.
   const payments = sub.payments.filter((p) => p.status === 'paid' || (live && p.status === 'issued'));
   return (
@@ -224,6 +372,27 @@ function CurrentSubscription({ sub, busy, canBill, onCancel }) {
 
       <p style={styles.muted}>{describe(sub)}</p>
 
+      {sub.pendingChange && (
+        <p style={styles.muted}>
+          Switching to <strong>{sub.pendingChange.name}</strong> ({rupees(sub.pendingChange.amount)} /{' '}
+          {PER[sub.pendingChange.period]}) on {date(sub.pendingChange.at)}.{' '}
+          {canBill && (
+            <button style={styles.textBtn} disabled={busy} onClick={onCancelChange}>
+              Cancel change
+            </button>
+          )}
+        </p>
+      )}
+
+      {live && canBill && !sub.cancelAtPeriodEnd && sub.status !== 'past_due' && (
+        <p style={styles.muted}>
+          {sub.collectionMethod === 'auto' ? "Don't want autopay? " : 'Rather not pay by hand each time? '}
+          <button style={styles.textBtn} disabled={busy} onClick={() => onSwitchMethod(otherMethod)}>
+            Switch to {METHODS[otherMethod]}
+          </button>
+        </p>
+      )}
+
       {/* Opens Razorpay's payment page; its callback brings the customer back here, where the payment shows up. */}
       {sub.openInvoice && canBill && (
         <a href={sub.openInvoice.payUrl} style={{ ...styles.payBtn, marginTop: 12 }}>
@@ -246,7 +415,10 @@ function CurrentSubscription({ sub, busy, canBill, onCancel }) {
               {payments.map((p) => (
                 <tr key={p.invoiceId}>
                   <td style={styles.td}>{date(p.date)}</td>
-                  <td style={styles.td}>{rupees(p.amount)}</td>
+                  <td style={styles.td}>
+                    {rupees(p.amount)}
+                    {p.kind === 'upgrade' && <span style={styles.per}> · upgrade</span>}
+                  </td>
                   <td style={styles.td}>{INVOICE_STATUS[p.status] ?? p.status}</td>
                   <td style={styles.td}>{p.paymentId ?? '—'}</td>
                 </tr>
@@ -271,7 +443,7 @@ function describe(sub) {
     case 'active':
       if (!sub.currentPeriodEnd) return 'Payment method authorised — the first charge is being processed…';
       if (sub.cancelAtPeriodEnd) return `Cancelled — no more charges. ${sub.name} stays on until ${until}.`;
-      if (!manual) return `Autopay renews it on ${until} for ${rupees(sub.amount)}.`;
+      if (!manual) return `Autopay renews it on ${until}.`;
       return sub.openInvoice
         ? `Paid until ${until}. Your next payment is ready.`
         : `Paid until ${until}. We'll send a payment link a week before.`;

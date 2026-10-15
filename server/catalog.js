@@ -16,7 +16,9 @@ const label = (plan) => `${plan.key} v${plan.version}`;
 
 // Checks a plan's entitlements against the catalog and drops anything off or 0: a missing
 // key already means that, so the stored JSON lists only what the plan actually grants.
-export function normalizeEntitlements(input, features) {
+// With { explicit: true } (a workspace's overrides) false and 0 are kept: there they mean
+// "turn this off for this workspace", which is different from "same as the plan".
+export function normalizeEntitlements(input, features, { explicit = false } = {}) {
   if (!isObject(input)) throw new HttpError(400, 'entitlements must be an object');
   const extra = Object.keys(input).find((k) => k !== 'features' && k !== 'limits');
   if (extra) throw new HttpError(400, `Unknown section "${extra}" — use "features" and "limits"`);
@@ -36,26 +38,35 @@ export function normalizeEntitlements(input, features) {
       }
       if (section === 'features') {
         if (typeof value !== 'boolean') throw new HttpError(400, `"${key}" must be true or false`);
-        if (value) out.features[key] = true;
+        if (value || explicit) out.features[key] = value;
       } else {
         if (!Number.isSafeInteger(value) || value < -1) {
           throw new HttpError(400, `"${key}" must be a whole number (-1 = unlimited)`);
         }
-        if (value !== 0) out.limits[key] = value;
+        if (value !== 0 || explicit) out.limits[key] = value;
       }
     }
   }
   return out;
 }
 
-/** Every catalog feature with this plan's value for it (false / 0 when the plan doesn't grant it). */
-export function resolveEntitlements(entitlements, features) {
-  return features.map((f) => ({
-    key: f.key,
-    name: f.name,
-    type: f.type,
-    value: f.type === 'boolean' ? entitlements.features?.[f.key] === true : (entitlements.limits?.[f.key] ?? 0),
-  }));
+/**
+ * Every catalog feature with this plan's value for it (false / 0 when the plan doesn't grant it).
+ * A workspace's overrides replace the plan's value; those come back with overridden and planValue.
+ */
+export function resolveEntitlements(entitlements, features, overrides) {
+  return features.map((f) => {
+    const planValue =
+      f.type === 'boolean' ? entitlements.features?.[f.key] === true : (entitlements.limits?.[f.key] ?? 0);
+    const override = overrides?.[SECTION[f.type]]?.[f.key];
+    return {
+      key: f.key,
+      name: f.name,
+      type: f.type,
+      value: override ?? planValue,
+      ...(override !== undefined && { overridden: true, planValue }),
+    };
+  });
 }
 
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -110,6 +121,13 @@ export async function deleteFeature(key) {
   if (grantedBy.length) {
     const list = grantedBy.map((p) => `${label(p)} (${p.status})`).join(', ');
     throw new HttpError(409, `"${key}" is still granted by ${list}`);
+  }
+  const { rows: overriddenBy } = await query(
+    `SELECT name FROM tenants WHERE product_id = $1 AND (overrides->'features' ? $2 OR overrides->'limits' ? $2) ORDER BY name LIMIT 5`,
+    [productId, key]
+  );
+  if (overriddenBy.length) {
+    throw new HttpError(409, `"${key}" is still overridden for ${overriddenBy.map((t) => t.name).join(', ')} — clear those first`);
   }
   const { rowCount } = await query('DELETE FROM features WHERE product_id = $1 AND key = $2', [productId, key]);
   if (!rowCount) throw new HttpError(404, 'Feature not found');
@@ -376,6 +394,12 @@ export async function findSellablePrice(id) {
     `${PRICE_WITH_PLAN} WHERE pp.id = $1 AND p.product_id = $2 AND pp.is_active AND p.status = 'active'`,
     [id, productId]
   );
+  return toSellable(rows[0]);
+}
+
+/** Any price of this product, retired or not (e.g. the one a customer is still paying), or null. */
+export async function findPrice(id) {
+  const { rows } = await query(`${PRICE_WITH_PLAN} WHERE pp.id = $1 AND p.product_id = $2`, [id, productId]);
   return toSellable(rows[0]);
 }
 

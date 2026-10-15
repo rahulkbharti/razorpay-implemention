@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { styles } from './styles.js';
+import AdminOverrides from './AdminOverrides.jsx';
 
 const date = (value) =>
   value ? new Date(value).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
@@ -7,6 +8,7 @@ const METHOD = { auto: 'Autopay', manual: 'Manual' };
 
 export default function AdminTenants({ tenants, call, run, busy }) {
   const [job, setJob] = useState(null);
+  const [editing, setEditing] = useState(null); // tenant id whose overrides are open
 
   // The server runs this every hour; running it now is handy for testing reminders and expiry.
   async function runJob() {
@@ -44,6 +46,11 @@ export default function AdminTenants({ tenants, call, run, busy }) {
               <tr key={t.id}>
                 <td style={styles.td}>
                   <strong>{t.name}</strong>
+                  <div>
+                    <button style={{ ...styles.textBtn, fontSize: 13 }} onClick={() => setEditing(t.id)}>
+                      Overrides
+                    </button>
+                  </div>
                 </td>
                 <td style={styles.td}>
                   {t.ownerEmail}
@@ -51,6 +58,7 @@ export default function AdminTenants({ tenants, call, run, busy }) {
                 </td>
                 <td style={styles.td}>
                   <code style={styles.key}>{t.plan}</code>
+                  {t.hasOverrides && <span style={styles.badge('draft')}>custom</span>}
                 </td>
                 <td style={styles.td}>
                   {t.subscription ? (
@@ -73,6 +81,9 @@ export default function AdminTenants({ tenants, call, run, busy }) {
           </tbody>
         </table>
       </div>
+      {editing && (
+        <AdminOverrides key={editing} tenantId={editing} call={call} run={run} busy={busy} onClose={() => setEditing(null)} />
+      )}
     </>
   );
 }

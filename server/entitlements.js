@@ -33,6 +33,13 @@ export function registerMeter(key) {
   });
 }
 
+/** Everything counted for a workspace right now: key → used (this month, for metered limits). */
+export async function currentUsage(tenantId) {
+  const usage = {};
+  for (const [key, counter] of counters) usage[key] = await counter.count({ query }, tenantId);
+  return usage;
+}
+
 // Metered limits count per calendar month in India time, not per billing period: a yearly plan's
 // "API calls / month" still resets every month, and changing plans mid-month changes the limit
 // but keeps what was already used (so cancelling and resubscribing doesn't reset it either).

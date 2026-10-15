@@ -2,7 +2,8 @@
 // real user accounts with an admin role.
 import express from 'express';
 import * as catalog from './catalog.js';
-import { listTenants } from './billing.js';
+import { currentPlan, listTenants } from './billing.js';
+import { query } from './db.js';
 import { runBillingJob } from './manual.js';
 import { HttpError, safeEqual, toId } from './util.js';
 
@@ -127,6 +128,36 @@ export function adminRouter(adminToken) {
     res.json(await listTenants());
   });
 
+  // One workspace's overrides: every catalog feature with the plan's value and the override, if any.
+  router.get('/tenants/:id/overrides', async (req, res) => {
+    const t = await tenant(req);
+    const plan = await currentPlan(t.id);
+    res.json({
+      tenant: { id: t.id, name: t.name },
+      plan: plan && { key: plan.key, name: plan.name, version: plan.version },
+      note: t.overrides_note,
+      features: (plan?.features ?? []).map((f) => ({
+        key: f.key,
+        name: f.name,
+        type: f.type,
+        planValue: f.overridden ? f.planValue : f.value,
+        override: f.overridden ? f.value : null,
+      })),
+    });
+  });
+
+  // Replaces the workspace's overrides. Every value given replaces the plan's (false and 0 too);
+  // leave a key out to follow the plan. They apply whatever plan the workspace is on, until removed.
+  router.put('/tenants/:id/overrides', async (req, res) => {
+    const t = await tenant(req);
+    const overrides = catalog.normalizeEntitlements(req.body?.overrides ?? {}, await catalog.listFeatures(), {
+      explicit: true,
+    });
+    const note = text(req.body?.note, 'note', { blank: true, max: 500 }) ?? '';
+    await query('UPDATE tenants SET overrides = $2, overrides_note = $3 WHERE id = $1', [t.id, JSON.stringify(overrides), note]);
+    res.json({ overrides, note });
+  });
+
   // Runs the hourly billing job now (renewal invoices, reminders, grace period, expiry).
   router.post('/jobs/billing', async (_req, res) => {
     res.json(await runBillingJob());
@@ -172,6 +203,12 @@ function bool(value, field) {
   if (value === undefined) return undefined;
   if (typeof value !== 'boolean') throw new HttpError(400, `${field} must be true or false`);
   return value;
+}
+
+async function tenant(req) {
+  const { rows } = await query('SELECT * FROM tenants WHERE id = $1 AND product_id = $2', [id(req), catalog.productId]);
+  if (!rows[0]) throw new HttpError(404, 'Workspace not found');
+  return rows[0];
 }
 
 function id(req) {

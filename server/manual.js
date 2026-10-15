@@ -2,6 +2,9 @@
 // The first period is paid in Checkout (a Razorpay order). Before each renewal the billing job
 // opens an invoice with a Razorpay payment link and sends reminders to it. An unpaid renewal
 // keeps its features during a grace period, then the subscription expires.
+//
+// Invoices are also how a dearer plan is paid for mid-period (kind 'upgrade', see changes.js),
+// for manual and autopay subscriptions alike.
 import { query, tx, withLock } from './db.js';
 import { razorpay } from './razorpay.js';
 
@@ -18,6 +21,7 @@ const REMINDERS = [
   [0, 'due_today'],
 ];
 const LIVE = `('trialing', 'active', 'past_due')`;
+const LIVE_STATUSES = ['trialing', 'active', 'past_due'];
 
 const day = (d) => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 
@@ -33,14 +37,31 @@ const OWNER = `
 /** Opens the invoice for a manual subscription's first period, with the Razorpay order Checkout pays it with. */
 export async function openFirstInvoice(subscriptionId) {
   const { rows } = await query(
-    `INSERT INTO invoices (subscription_id, tenant_id, amount, currency, period_start, period_end, due_at)
-     SELECT s.id, s.tenant_id, pp.amount, pp.currency, now(), now() + billing_interval(pp.period), now()
+    `INSERT INTO invoices (subscription_id, tenant_id, plan_id, price_id, amount, currency, period_start, period_end, due_at)
+     SELECT s.id, s.tenant_id, s.plan_id, s.price_id, pp.amount, pp.currency, now(), now() + billing_interval(pp.period), now()
      FROM subscriptions s JOIN plan_prices pp ON pp.id = s.price_id
      WHERE s.id = $1
      RETURNING *`,
     [subscriptionId]
   );
-  const invoice = rows[0];
+  return withOrder(rows[0]);
+}
+
+/**
+ * Opens an invoice for the prorated difference of moving to a dearer plan for the rest of the
+ * current period. Paying it switches the plan (see applyUpgrade).
+ */
+export async function openUpgradeInvoice(sub, price, amount) {
+  const { rows } = await query(
+    `INSERT INTO invoices (subscription_id, tenant_id, kind, plan_id, price_id, amount, currency, period_start, period_end, due_at)
+     VALUES ($1, $2, 'upgrade', $3, $4, $5, $6, $7, $8, now())
+     RETURNING *`,
+    [sub.id, sub.tenant_id, price.planId, price.id, amount, price.currency, sub.current_period_start, sub.current_period_end]
+  );
+  return withOrder(rows[0]);
+}
+
+async function withOrder(invoice) {
   const order = await razorpay.orders.create({
     amount: invoice.amount,
     currency: invoice.currency,
@@ -58,23 +79,23 @@ export async function openFirstInvoice(subscriptionId) {
  *   - today, for the first payment or after the subscription has ended
  */
 export async function applyInvoicePayment(invoiceId, { paymentId = null, amount } = {}) {
-  await tx(async (c) => {
+  const staleLinks = await tx(async (c) => {
     const { rows } = await c.query(
-      `SELECT i.*, pp.period FROM invoices i
-       JOIN subscriptions s ON s.id = i.subscription_id JOIN plan_prices pp ON pp.id = s.price_id
-       WHERE i.id = $1 FOR UPDATE OF i`,
+      `SELECT i.*, pp.period FROM invoices i JOIN plan_prices pp ON pp.id = i.price_id WHERE i.id = $1 FOR UPDATE OF i`,
       [invoiceId]
     );
     const invoice = rows[0];
-    if (!invoice || invoice.status === 'paid') return;
+    if (!invoice || invoice.status === 'paid') return [];
     if (amount !== undefined && amount !== invoice.amount) {
       console.error(`[billing] payment ${paymentId} of ${amount} doesn't match invoice ${invoice.id} (${invoice.amount})`);
-      return;
+      return [];
     }
 
     const { rows: subs } = await c.query('SELECT * FROM subscriptions WHERE id = $1 FOR UPDATE', [invoice.subscription_id]);
     const sub = subs[0];
-    const continuing = ['trialing', 'active', 'past_due'].includes(sub.status);
+    const continuing = LIVE_STATUSES.includes(sub.status);
+    if (invoice.kind === 'upgrade') return applyUpgrade(c, invoice, sub, paymentId, continuing);
+
     // Recorded as paid even if it can't be applied below, so the money is never lost track of.
     // A void invoice counts too: if the customer paid it anyway, they get what they paid for.
     const { rows: periods } = await c.query(
@@ -94,17 +115,53 @@ export async function applyInvoicePayment(invoiceId, { paymentId = null, amount 
       );
       if (other[0]) {
         console.error(`[billing] invoice ${invoice.id} was paid, but workspace ${sub.tenant_id} already has subscription ${other[0].id} — refund it by hand`);
-        return;
+        return [];
       }
     }
+    // Once the paid period has begun, the workspace is on the plan the invoice billed: the same one,
+    // or a scheduled change (late payment). Paid early, the billing job switches it when the period begins.
     await c.query(
       `UPDATE subscriptions
        SET status = 'active', current_period_start = $2, current_period_end = $3, ended_at = NULL,
-           cancel_at_period_end = false, updated_at = now()
+           cancel_at_period_end = false, updated_at = now(),
+           plan_id = CASE WHEN $2 <= now() THEN $4 ELSE plan_id END,
+           price_id = CASE WHEN $2 <= now() THEN $5 ELSE price_id END,
+           pending_plan_id = CASE WHEN $2 <= now() THEN NULL ELSE pending_plan_id END,
+           pending_price_id = CASE WHEN $2 <= now() THEN NULL ELSE pending_price_id END,
+           pending_change_at = CASE WHEN $2 <= now() THEN NULL ELSE pending_change_at END
        WHERE id = $1`,
-      [sub.id, periods[0].period_start, periods[0].period_end]
+      [sub.id, periods[0].period_start, periods[0].period_end, invoice.plan_id, invoice.price_id]
     );
+    return [];
   });
+  await cancelLinks(staleLinks);
+}
+
+// The prorated charge for a dearer plan, paid: the plan changes now; the billing period stays.
+// An open renewal invoice billed the old price, so it's voided and the billing job reissues it.
+// Returns the payment links to cancel.
+async function applyUpgrade(c, invoice, sub, paymentId, continuing) {
+  await c.query(`UPDATE invoices SET status = 'paid', paid_at = now(), razorpay_payment_id = $2 WHERE id = $1`, [
+    invoice.id,
+    paymentId,
+  ]);
+  if (!continuing) {
+    console.error(`[billing] upgrade invoice ${invoice.id} was paid, but subscription ${sub.id} is ${sub.status} — refund it by hand`);
+    return [];
+  }
+  await c.query(
+    `UPDATE subscriptions
+     SET plan_id = $2, price_id = $3, pending_plan_id = NULL, pending_price_id = NULL, pending_change_at = NULL,
+         updated_at = now()
+     WHERE id = $1`,
+    [sub.id, invoice.plan_id, invoice.price_id]
+  );
+  const { rows } = await c.query(
+    `UPDATE invoices SET status = 'void' WHERE subscription_id = $1 AND status = 'open' AND id <> $2
+     RETURNING razorpay_payment_link_id`,
+    [sub.id, invoice.id]
+  );
+  return rows;
 }
 
 /** For order.paid / payment.captured webhooks. */
@@ -166,9 +223,10 @@ async function cancelLinks(rows) {
 async function attachPaymentLink(invoice) {
   const { rows } = await query(
     `SELECT o.*, p.name AS plan_name, pp.period
-     FROM subscriptions s JOIN plans p ON p.id = s.plan_id JOIN plan_prices pp ON pp.id = s.price_id ${OWNER}
-     WHERE s.id = $1`,
-    [invoice.subscription_id]
+     FROM invoices i JOIN subscriptions s ON s.id = i.subscription_id
+     JOIN plans p ON p.id = i.plan_id JOIN plan_prices pp ON pp.id = i.price_id ${OWNER}
+     WHERE i.id = $1`,
+    [invoice.id]
   );
   const o = rows[0];
   const link = await razorpay.paymentLink.create({
@@ -233,24 +291,39 @@ export async function runBillingJob() {
       [GRACE_DAYS]
     );
 
-    // 2. Open the invoice for the next period once it's close. Renewals keep the price the
-    //    customer signed up at, even if that price has since been retired.
+    // 2. Scheduled plan changes (downgrades, monthly → yearly) take effect when their period
+    //    begins, for autopay too (Razorpay switches its own plan then). An ended subscription drops its.
+    s.planChanges = await count(
+      `UPDATE subscriptions
+       SET plan_id = pending_plan_id, price_id = pending_price_id,
+           pending_plan_id = NULL, pending_price_id = NULL, pending_change_at = NULL, updated_at = now()
+       WHERE pending_change_at <= now() AND status IN ${LIVE}`
+    );
+    await query(
+      `UPDATE subscriptions SET pending_plan_id = NULL, pending_price_id = NULL, pending_change_at = NULL
+       WHERE pending_price_id IS NOT NULL AND status NOT IN ${LIVE}`
+    );
+
+    // 3. Open the invoice for the next period once it's close, at the next period's price: the
+    //    scheduled change if there is one, else the price the customer signed up at (even if that
+    //    price has since been retired).
     s.invoicesOpened = await count(
-      `INSERT INTO invoices (subscription_id, tenant_id, amount, currency, period_start, period_end, due_at)
-       SELECT s.id, s.tenant_id, pp.amount, pp.currency,
+      `INSERT INTO invoices (subscription_id, tenant_id, plan_id, price_id, amount, currency, period_start, period_end, due_at)
+       SELECT s.id, s.tenant_id, pp.plan_id, pp.id, pp.amount, pp.currency,
               s.current_period_end, s.current_period_end + billing_interval(pp.period), s.current_period_end
-       FROM subscriptions s JOIN plan_prices pp ON pp.id = s.price_id
+       FROM subscriptions s
+       JOIN plan_prices pp ON pp.id = CASE WHEN s.pending_change_at <= s.current_period_end THEN s.pending_price_id ELSE s.price_id END
        WHERE s.${manual} AND s.status IN ${LIVE} AND NOT s.cancel_at_period_end
          AND s.current_period_end <= now() + make_interval(days => $1)
-       ON CONFLICT (subscription_id, period_start) DO NOTHING`,
+       ON CONFLICT (subscription_id, period_start) WHERE kind = 'period' AND status <> 'void' DO NOTHING`,
       [INVOICE_AHEAD_DAYS]
     );
 
-    // 3. Payment links for renewal invoices that don't have one yet (this also retries failures).
+    // 4. Payment links for renewal invoices that don't have one yet (this also retries failures).
     const { rows: needLinks } = await query(
       `SELECT i.* FROM invoices i JOIN subscriptions s ON s.id = i.subscription_id
-       WHERE i.status = 'open' AND i.razorpay_payment_link_id IS NULL AND i.razorpay_order_id IS NULL
-         AND s.status IN ${LIVE}`
+       WHERE i.status = 'open' AND i.kind = 'period' AND i.razorpay_payment_link_id IS NULL
+         AND i.razorpay_order_id IS NULL AND s.status IN ${LIVE}`
     );
     s.links = 0;
     for (const invoice of needLinks) {
@@ -260,7 +333,7 @@ export async function runBillingJob() {
       );
     }
 
-    // 4. Reminders: the most urgent one that's due and not sent yet. One created late skips the
+    // 5. Reminders: the most urgent one that's due and not sent yet. One created late skips the
     //    earlier ones instead of sending them all at once.
     const { rows: open } = await query(
       `SELECT i.id, i.razorpay_payment_link_id, o.email, o.phone,
@@ -282,7 +355,7 @@ export async function runBillingJob() {
       }
     }
 
-    // 5. Too late to pay this one: the customer can subscribe again from the pricing page.
+    // 6. Too late to pay this one: the customer can subscribe again from the pricing page.
     const { rows: voided } = await query(
       `UPDATE invoices SET status = 'void'
        WHERE status = 'open' AND due_at + make_interval(days => $1) <= now()

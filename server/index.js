@@ -12,6 +12,7 @@ import { payInvoiceByLink, payInvoiceByOrder, runBillingJob } from './manual.js'
 import { entitlementsRouter } from './entitlements.js';
 import { publicApiRouter, workspaceRouter } from './workspace.js';
 import { apiKeysRouter } from './apikeys.js';
+import { changesRouter } from './changes.js';
 import { HttpError, safeEqual } from './util.js';
 
 const {
@@ -87,6 +88,7 @@ app.get('/api/config', async (_req, res) => {
 app.use('/api/auth', authRouter());
 app.use('/api/admin', adminRouter(ADMIN_TOKEN));
 app.use('/api', billingRouter());
+app.use('/api', changesRouter());
 app.use('/api', entitlementsRouter());
 app.use('/api', workspaceRouter());
 app.use('/api', apiKeysRouter());

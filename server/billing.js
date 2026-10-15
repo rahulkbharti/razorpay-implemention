@@ -19,7 +19,7 @@ import {
 import { HttpError, toId } from './util.js';
 
 // How many times an autopay subscription charges before it completes (10 years ≈ "until cancelled").
-const TOTAL_COUNT = { monthly: 120, yearly: 10 };
+export const TOTAL_COUNT = { monthly: 120, yearly: 10 };
 
 // Razorpay's subscription status → ours. 'authenticated' means the mandate is set up and the
 // first charge is settling (or, with a trial, scheduled for when the trial ends).
@@ -41,10 +41,14 @@ const IN_ACCESS = `('trialing', 'active', 'past_due')`;
 
 /* ---------- Current plan ---------- */
 
-/** The plan a workspace's features come from: its paid (or trial) plan version, or the product's default plan. */
+/**
+ * The plan a workspace's features come from: its paid (or trial) plan version, or the product's
+ * default plan, with the workspace's overrides (set by an admin) applied on top.
+ */
 export async function currentPlan(tenantId) {
-  const [features, { rows }] = await Promise.all([
+  const [features, overrides, { rows }] = await Promise.all([
     listFeatures(),
+    tenantOverrides(tenantId),
     query(
       `SELECT p.key, p.name, p.version, p.entitlements, true AS paid
        FROM subscriptions s JOIN plans p ON p.id = s.plan_id
@@ -65,8 +69,13 @@ export async function currentPlan(tenantId) {
     name: plan.name,
     version: plan.version,
     paid: plan.paid,
-    features: resolveEntitlements(plan.entitlements, features),
+    features: resolveEntitlements(plan.entitlements, features, overrides),
   };
+}
+
+export async function tenantOverrides(tenantId) {
+  const { rows } = await query('SELECT overrides FROM tenants WHERE id = $1', [tenantId]);
+  return rows[0]?.overrides;
 }
 
 // One free trial per workspace. A checkout that was never finished doesn't use it up.
@@ -80,53 +89,64 @@ async function trialUsed(tenantId) {
 
 /* ---------- Subscriptions ---------- */
 
-const SUBSCRIPTION = `
-  SELECT s.*, p.key AS plan_key, p.name AS plan_name, p.version AS plan_version, pp.period, pp.amount, pp.currency
+export const SUBSCRIPTION = `
+  SELECT s.*, p.key AS plan_key, p.name AS plan_name, p.version AS plan_version, pp.period, pp.amount, pp.currency,
+         np.name AS pending_plan_name, npp.period AS pending_period, npp.amount AS pending_amount
   FROM subscriptions s
   JOIN plans p ON p.id = s.plan_id
-  JOIN plan_prices pp ON pp.id = s.price_id`;
+  JOIN plan_prices pp ON pp.id = s.price_id
+  LEFT JOIN plans np ON np.id = s.pending_plan_id
+  LEFT JOIN plan_prices npp ON npp.id = s.pending_price_id`;
 
-async function getSubscription(id) {
+export async function getSubscription(id) {
   const { rows } = await query(`${SUBSCRIPTION} WHERE s.id = $1`, [id]);
   return rows[0];
 }
 
-async function liveSubscription(tenantId) {
+export async function liveSubscription(tenantId) {
   const { rows } = await query(`${SUBSCRIPTION} WHERE s.tenant_id = $1 AND s.status IN ${IN_ACCESS}`, [tenantId]);
   return rows[0] ?? null;
 }
 
-// Shape a subscription and its payment history for the client. Autopay invoices live in
-// Razorpay (one per billing cycle); manual ones are ours.
-async function subscriptionView(s) {
-  const payments = s.razorpay_subscription_id
-    ? (await razorpay.invoices.all({ subscription_id: s.razorpay_subscription_id })).items.map((inv) => ({
-        invoiceId: inv.id,
-        paymentId: inv.payment_id,
-        amount: inv.amount,
-        status: inv.status,
-        date: fromUnix(inv.paid_at ?? inv.billing_start ?? inv.created_at),
-      }))
-    : (
-        await query(
-          `SELECT * FROM invoices WHERE subscription_id = $1 AND status <> 'void' ORDER BY period_start DESC`,
-          [s.id]
-        )
-      ).rows.map((inv) => ({
-        invoiceId: inv.id,
-        paymentId: inv.razorpay_payment_id,
-        amount: inv.amount,
-        status: inv.status === 'open' ? 'issued' : inv.status,
-        date: inv.paid_at ?? inv.due_at,
-        dueAt: inv.due_at,
-        payUrl: inv.status === 'open' ? inv.payment_link_url : null,
-      }));
+// Shape a subscription and its payment history for the client. Autopay cycles are invoiced by
+// Razorpay; manual periods and upgrade charges are our invoices. A subscription switched between
+// the two has both. An upgrade nobody paid for isn't shown: it was just an abandoned checkout.
+export async function subscriptionView(s) {
+  const [fromRazorpay, { rows: ours }] = await Promise.all([
+    s.razorpay_subscription_id
+      ? razorpay.invoices.all({ subscription_id: s.razorpay_subscription_id }).then((r) => r.items)
+      : [],
+    query(
+      `SELECT * FROM invoices WHERE subscription_id = $1 AND status <> 'void' AND NOT (kind = 'upgrade' AND status = 'open')`,
+      [s.id]
+    ),
+  ]);
+  const payments = [
+    ...fromRazorpay.map((inv) => ({
+      invoiceId: inv.id,
+      paymentId: inv.payment_id,
+      amount: inv.amount,
+      status: inv.status,
+      date: fromUnix(inv.paid_at ?? inv.billing_start ?? inv.created_at),
+    })),
+    ...ours.map((inv) => ({
+      invoiceId: inv.id,
+      kind: inv.kind,
+      paymentId: inv.razorpay_payment_id,
+      amount: inv.amount,
+      status: inv.status === 'open' ? 'issued' : inv.status,
+      date: inv.paid_at ?? inv.due_at,
+      dueAt: inv.due_at,
+      payUrl: inv.status === 'open' ? inv.payment_link_url : null,
+    })),
+  ].sort((a, b) => new Date(b.date) - new Date(a.date));
 
   return {
     id: s.id,
     status: s.status,
     collectionMethod: s.collection_method,
     planKey: s.plan_key,
+    priceId: s.price_id,
     name: s.plan_name,
     planVersion: s.plan_version,
     period: s.period,
@@ -139,6 +159,13 @@ async function subscriptionView(s) {
         : null,
     cancelAtPeriodEnd: s.cancel_at_period_end,
     endedAt: s.ended_at,
+    pendingChange: s.pending_price_id && {
+      priceId: s.pending_price_id,
+      name: s.pending_plan_name,
+      period: s.pending_period,
+      amount: s.pending_amount,
+      at: s.pending_change_at,
+    },
     // The renewal the customer can pay right now (manual), from the reminder link.
     openInvoice: payments.find((p) => p.payUrl) ?? null,
     payments,
@@ -148,14 +175,14 @@ async function subscriptionView(s) {
 const fromUnix = (seconds) => (seconds ? new Date(seconds * 1000) : null);
 
 // Razorpay SDK errors carry the reason in err.error.description.
-const razorpayError = (fallback) => (err) => {
+export const razorpayError = (fallback) => (err) => {
   console.error(err);
   throw new HttpError(502, err?.error?.description || fallback);
 };
 
 // Each price gets its own Razorpay plan the first time someone subscribes to it with autopay.
 // Razorpay plans can't be edited, which is why a price row never changes once it has one.
-async function razorpayPlanFor(price) {
+export async function razorpayPlanFor(price) {
   if (price.razorpayPlanId) return price.razorpayPlanId;
   const plan = await razorpay.plans.create({
     period: price.period,
@@ -200,8 +227,11 @@ async function clearStale(tenantId) {
   }
 }
 
-/** Copies a Razorpay subscription's state onto our row. */
-async function applyRazorpaySubscription(sub) {
+/**
+ * Copies a Razorpay subscription's state onto our row. Only while the row is on autopay: after a
+ * switch to manual payment, late events about the old Razorpay subscription must not touch it.
+ */
+export async function applyRazorpaySubscription(sub) {
   const status = FROM_RAZORPAY[sub.status] ?? 'incomplete';
   const ended = status === 'cancelled' || status === 'expired';
   try {
@@ -213,7 +243,7 @@ async function applyRazorpaySubscription(sub) {
            ended_at = CASE WHEN $5 THEN COALESCE(ended_at, to_timestamp($6), now()) END,
            cancel_at_period_end = cancel_at_period_end AND NOT $5,
            updated_at = now()
-       WHERE razorpay_subscription_id = $1`,
+       WHERE razorpay_subscription_id = $1 AND collection_method = 'auto'`,
       [sub.id, status, sub.current_start ?? null, sub.current_end ?? null, ended, sub.ended_at ?? null, sub.status]
     );
   } catch (err) {
@@ -228,10 +258,11 @@ async function applyRazorpaySubscription(sub) {
  * the payload, so an event that arrives late or twice can't roll the status back.
  */
 export async function syncRazorpaySubscription(razorpaySubscriptionId) {
-  const { rows } = await query('SELECT 1 FROM subscriptions WHERE razorpay_subscription_id = $1', [
-    razorpaySubscriptionId,
-  ]);
-  if (!rows[0]) return console.warn(`[webhook] ignoring ${razorpaySubscriptionId}: not one of ours`);
+  const { rows } = await query(
+    `SELECT 1 FROM subscriptions WHERE razorpay_subscription_id = $1 AND collection_method = 'auto'`,
+    [razorpaySubscriptionId]
+  );
+  if (!rows[0]) return console.warn(`[webhook] ignoring ${razorpaySubscriptionId}: not an autopay subscription of ours`);
   const sub = await razorpay.subscriptions.fetch(razorpaySubscriptionId);
   await applyRazorpaySubscription(sub);
   console.log(`[webhook] ${sub.id} is ${sub.status}`);
@@ -243,6 +274,7 @@ export async function syncRazorpaySubscription(razorpaySubscriptionId) {
 export async function listTenants() {
   const { rows } = await query(
     `SELECT t.id, t.name, t.created_at, o.email, o.phone,
+            (t.overrides->'features' <> '{}' OR t.overrides->'limits' <> '{}') AS has_overrides,
             s.status, s.collection_method, s.current_period_end, s.cancel_at_period_end,
             CASE WHEN s.status IN ${IN_ACCESS} THEN p.key || ' v' || p.version
                  ELSE (SELECT default_plan_key FROM products WHERE id = $1) END AS plan
@@ -267,6 +299,7 @@ export async function listTenants() {
     ownerEmail: r.email,
     ownerPhone: r.phone,
     plan: r.plan,
+    hasOverrides: r.has_overrides,
     subscription: r.status && {
       status: r.status,
       collectionMethod: r.collection_method,
@@ -295,7 +328,7 @@ export function billingRouter() {
     let s = rows[0];
     // Webhooks are how we normally hear about payments, renewals and cancellations; re-reading
     // here keeps this right when they're late or not set up at all (e.g. locally without a tunnel).
-    if (s?.razorpay_subscription_id && !['cancelled', 'expired'].includes(s.status)) {
+    if (s?.collection_method === 'auto' && !['cancelled', 'expired'].includes(s.status)) {
       await applyRazorpaySubscription(
         await razorpay.subscriptions.fetch(s.razorpay_subscription_id).catch(razorpayError('Could not fetch subscription'))
       );
