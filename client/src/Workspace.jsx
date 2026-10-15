@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, formatLimit } from './api.js';
 import { styles } from './styles.js';
+import ApiKeys from './ApiKeys.jsx';
 
 // The product the customer pays for (a small demo). The server enforces every rule this page
 // shows; hiding or disabling things here only spares the customer a request it would refuse.
@@ -183,6 +184,8 @@ export default function Workspace({ config, me, onUpgrade }) {
           )}
         </div>
       )}
+
+      <ApiKeys canAdmin={canAdmin} onUsageChange={() => load().catch((e) => setResult({ ok: false, msg: e.message }))} />
     </>
   );
 }
@@ -194,7 +197,7 @@ function upgradeFor(plans, currentKey, key, allows) {
   );
 }
 
-function Meter({ name, limit, used }) {
+function Meter({ name, limit, used, resetsAt }) {
   const unlimited = limit === -1;
   const counted = used !== null;
   // At the limit is normal (nothing more can be added); over it only happens after a downgrade.
@@ -208,6 +211,12 @@ function Meter({ name, limit, used }) {
           {counted ? `${used.toLocaleString('en-IN')} / ${formatLimit(limit)}` : `${formatLimit(limit)} included`}
         </span>
       </div>
+      {/* Monthly usage (API calls) starts again from zero on the 1st. */}
+      {resetsAt && (
+        <div style={{ ...styles.per, fontSize: 12, marginBottom: 4 }}>
+          Resets on {new Date(resetsAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'Asia/Kolkata' })}
+        </div>
+      )}
       {counted && !unlimited && (
         <div style={styles.meterTrack} role="progressbar" aria-label={name} aria-valuemin={0} aria-valuemax={limit} aria-valuenow={used}>
           <div style={styles.meterFill(percent, level)} />

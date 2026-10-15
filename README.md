@@ -120,11 +120,42 @@ await withinLimit(req, 'projects', (c) => c.query('INSERT INTO projects ...'));
   is marked inactive), so everything works again after an upgrade. Removing things is always allowed.
 - Customers keep the plan version they bought: publishing a new version with lower limits only
   affects new subscribers.
-- `GET /api/me/entitlements` returns `{ plan, features: { key: bool }, limits: { key: { name, limit, used } } }`
-  for the UI. `used` is `null` for a limit nothing counts yet (API calls, until usage metering).
+- `GET /api/me/entitlements` returns `{ plan, features: { key: bool }, limits: { key: { name, limit, used, resetsAt? } } }`
+  for the UI. `used` is `null` for a limit nothing counts; `resetsAt` is set for monthly (metered) limits.
 
 The **Workspace** tab is a small demo of the product itself (`server/workspace.js`): projects count
-against the `projects` limit, and a custom domain needs the `custom_domain` feature.
+against the `projects` limit, a custom domain needs the `custom_domain` feature, and calls to the
+public API count against `api_calls_monthly`.
+
+## Metered usage & the public API
+Some limits aren't about how many things exist but how much is used in a month, like API calls.
+
+```js
+registerMeter('api_calls_monthly');
+await consume(req, 'api_calls_monthly'); // records 1, or throws a 429 if this month's limit is used up
+```
+
+- `consume` checks and records in **one atomic SQL statement** (an upsert on `usage_counters` that
+  only applies while under the limit), so concurrent calls can't go over it. A refused call records nothing.
+- Usage counts per **calendar month in India time** and starts again from zero on the 1st (a new
+  `usage_counters` row; old rows are the history). Not per billing period: a yearly plan's
+  "API calls / month" still resets monthly, and changing plans mid-month changes the limit but keeps
+  what was used, so cancelling and resubscribing doesn't reset it either.
+
+**API keys** (`server/apikeys.js`, Workspace → API): owners and admins create keys for their own code.
+A key (`sk_` + 32 random bytes) is shown once; only its SHA-256 hash and last 4 characters are stored.
+Up to 10 active keys per workspace; revoking takes effect on the next request.
+
+**Public API** (`/api/v1`): `Authorization: Bearer sk_...`. Every authenticated call counts, and plan
+limits apply exactly as in the app (e.g. `POST /api/v1/projects` still respects the `projects` limit).
+Responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining` (`-1` = unlimited) and `X-RateLimit-Reset`
+(unix time of the next 1st). Once the month's calls are used up: `429` with `Retry-After` and
+`{ code: 'quota_exceeded', limit, used, resetsAt, upgradeTo }`.
+
+```bash
+curl http://localhost:5000/api/v1/projects -H "Authorization: Bearer sk_..."
+curl -X POST http://localhost:5000/api/v1/projects -H "Authorization: Bearer sk_..."      -H "Content-Type: application/json" -d '{"name":"From my server"}'
+```
 
 ## Run
 ```bash
@@ -168,6 +199,8 @@ subscriptions `subscription.authenticated`, `subscription.activated`, `subscript
 
 ## Production checklist
 - Rate-limit login and signup; add email verification and password reset.
+- A monthly quota isn't burst protection: add a per-second rate limit on `/api/v1` too.
+- Cache entitlements briefly (each API call reads the plan) once traffic grows.
 - Plan upgrades/downgrades and switching between autopay and manual payment.
 - Watch the logs for `refund it by hand`: a payment that arrived for a checkout the customer had
   already replaced (e.g. paid in two tabs). The money is recorded on the invoice but not applied.

@@ -10,7 +10,8 @@ import { authRouter, loadSession } from './auth.js';
 import { billingRouter, syncRazorpaySubscription } from './billing.js';
 import { payInvoiceByLink, payInvoiceByOrder, runBillingJob } from './manual.js';
 import { entitlementsRouter } from './entitlements.js';
-import { workspaceRouter } from './workspace.js';
+import { publicApiRouter, workspaceRouter } from './workspace.js';
+import { apiKeysRouter } from './apikeys.js';
 import { HttpError, safeEqual } from './util.js';
 
 const {
@@ -88,6 +89,8 @@ app.use('/api/admin', adminRouter(ADMIN_TOKEN));
 app.use('/api', billingRouter());
 app.use('/api', entitlementsRouter());
 app.use('/api', workspaceRouter());
+app.use('/api', apiKeysRouter());
+app.use('/api/v1', publicApiRouter());
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
 

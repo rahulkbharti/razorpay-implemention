@@ -4,6 +4,7 @@
 //
 //   router.put('/domain', requireUser, requireFeature('custom_domain'), handler)
 //   await withinLimit(req, 'projects', (c) => c.query('INSERT INTO projects ...'))
+//   await consume(req, 'api_calls_monthly')
 import express from 'express';
 import { query, tx } from './db.js';
 import { currentPlan } from './billing.js';
@@ -11,12 +12,34 @@ import { listPublicPlans } from './catalog.js';
 import { requireUser } from './auth.js';
 import { HttpError } from './util.js';
 
-// How much of each limit a workspace uses: key → (db, tenantId) => number, where db is a pg
-// client or { query }. Registered by the code that owns the data (see workspace.js).
+// How much of each limit a workspace uses: key → { count(db, tenantId) => number, metered },
+// where db is a pg client or { query }. Registered by the code that owns the data (workspace.js):
+//   registerUsage(key, count)  things that exist, like projects; checked with withinLimit
+//   registerMeter(key)         usage that builds up over a month, like API calls; recorded with consume
 const counters = new Map();
 export function registerUsage(key, count) {
-  counters.set(key, count);
+  counters.set(key, { count, metered: false });
 }
+export function registerMeter(key) {
+  counters.set(key, {
+    metered: true,
+    count: async (db, tenantId) => {
+      const { rows } = await db.query(
+        `SELECT used FROM usage_counters WHERE tenant_id = $1 AND feature_key = $2 AND period = ${PERIOD}`,
+        [tenantId, key]
+      );
+      return Number(rows[0]?.used ?? 0);
+    },
+  });
+}
+
+// Metered limits count per calendar month in India time, not per billing period: a yearly plan's
+// "API calls / month" still resets every month, and changing plans mid-month changes the limit
+// but keeps what was already used (so cancelling and resubscribing doesn't reset it either).
+const TIME_ZONE = 'Asia/Kolkata';
+const PERIOD = `date_trunc('month', now() AT TIME ZONE '${TIME_ZONE}')::date`;
+const RESETS_AT = `(date_trunc('month', now() AT TIME ZONE '${TIME_ZONE}') + interval '1 month') AT TIME ZONE '${TIME_ZONE}'`;
+const day = (d) => d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: TIME_ZONE });
 
 const warned = new Set();
 
@@ -75,15 +98,15 @@ export const requireFeature = (key) => async (req, _res, next) => {
  * blocks adding more: nothing that already exists is touched.
  */
 export async function withinLimit(req, key, create) {
-  const count = counters.get(key);
-  if (!count) throw new Error(`No usage counter registered for "${key}"`);
+  const counter = counters.get(key);
+  if (!counter || counter.metered) throw new Error(`"${key}" needs registerUsage('${key}', count) to be used with withinLimit`);
   const ent = await entitlementsFor(req);
   const limit = ent.limit(key);
 
   return tx(async (c) => {
     if (limit !== -1) {
       await c.query('SELECT pg_advisory_xact_lock(hashtext($1), $2)', [key, ent.tenantId]);
-      const used = await count(c, ent.tenantId);
+      const used = await counter.count(c, ent.tenantId);
       if (used >= limit) {
         const upgradeTo = await upgradeFor(ent, key, (value) => value === -1 || value > used);
         const name = ent.name(key).toLowerCase();
@@ -98,6 +121,43 @@ export async function withinLimit(req, key, create) {
     }
     return create(c);
   });
+}
+
+/**
+ * Records `amount` of a metered limit (e.g. one API call) if it still fits in this month's limit.
+ * Checking and recording is one atomic statement, so concurrent requests can't go over the limit.
+ * Returns { limit, used, resetsAt }; throws a 429 (recording nothing) when it doesn't fit.
+ */
+export async function consume(req, key, amount = 1) {
+  if (!counters.get(key)?.metered) throw new Error(`"${key}" isn't metered: call registerMeter('${key}') first`);
+  const ent = await entitlementsFor(req);
+  const limit = ent.limit(key);
+
+  const { rows } = await query(
+    `INSERT INTO usage_counters AS u (tenant_id, feature_key, period, used)
+     SELECT $1, $2, ${PERIOD}, $3::bigint WHERE $4::bigint = -1 OR $3::bigint <= $4::bigint
+     ON CONFLICT (tenant_id, feature_key, period) DO UPDATE SET used = u.used + EXCLUDED.used
+       WHERE $4::bigint = -1 OR u.used + EXCLUDED.used <= $4::bigint
+     RETURNING used, ${RESETS_AT} AS resets_at`,
+    [ent.tenantId, key, amount, limit]
+  );
+  if (rows[0]) return { limit, used: Number(rows[0].used), resetsAt: rows[0].resets_at };
+
+  const used = await counters.get(key).count({ query }, ent.tenantId);
+  const resetsAt = await nextReset();
+  const upgradeTo = await upgradeFor(ent, key, (value) => value === -1 || value >= used + amount);
+  const n = (x) => x.toLocaleString('en-IN');
+  throw new HttpError(
+    429,
+    `${ent.name(key)} limit reached: ${n(used)} of ${n(limit)} used on the ${planName(ent)} plan. It resets on ${day(resetsAt)}, or upgrade for more now.`,
+    { code: 'quota_exceeded', feature: key, limit, used, resetsAt, upgradeTo }
+  );
+}
+
+/** When metered usage next starts again from zero. */
+async function nextReset() {
+  const { rows } = await query(`SELECT ${RESETS_AT} AS resets_at`);
+  return rows[0].resets_at;
 }
 
 const planName = (ent) => ent.plan?.name ?? 'current';
@@ -119,14 +179,16 @@ export function entitlementsRouter() {
     const ent = await entitlementsFor(req);
     const features = {};
     const limits = {};
+    let resetsAt;
     for (const f of ent.plan?.features ?? []) {
       if (f.type === 'boolean') {
         features[f.key] = f.value;
-      } else {
-        const count = counters.get(f.key);
-        // used is null for a limit nothing counts yet (e.g. API calls, until usage is metered).
-        limits[f.key] = { name: f.name, limit: f.value, used: count ? await count({ query }, ent.tenantId) : null };
+        continue;
       }
+      // used is null for a limit nothing counts; resetsAt is set for metered (monthly) ones.
+      const counter = counters.get(f.key);
+      limits[f.key] = { name: f.name, limit: f.value, used: counter ? await counter.count({ query }, ent.tenantId) : null };
+      if (counter?.metered) limits[f.key].resetsAt = resetsAt ??= await nextReset();
     }
     const plan = ent.plan && { key: ent.plan.key, name: ent.plan.name, version: ent.plan.version, paid: ent.plan.paid };
     res.json({ plan, features, limits });
