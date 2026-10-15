@@ -96,10 +96,18 @@ what the workspace would lose); `POST /api/subscription/change` does it.
 - **UPI Autopay can't be updated** (Razorpay: "subscriptions cannot be updated when payment mode is upi").
   Then the mandate is replaced: a new Razorpay subscription for the new plan, starting when the current
   (paid) period or trial ends, with the prorated difference as an add-on, so the customer approves the
-  new amount and pays the difference in one Checkout. `POST /api/subscription/mandate/verify` checks it
-  replaces this workspace's current mandate (our `notes` on it say what it replaces and does), cancels the
-  old one and applies the change. If Razorpay won't cancel the old one, the new one is cancelled instead
-  and nothing changes, so two mandates never charge the same cycle. Closing Checkout changes nothing. Undoing a change re-schedules the plan the workspace is on, rather than
+  new amount and pays the difference in one Checkout (Razorpay charges a future-start mandate's add-on
+  when it's approved; without one, approving charges ₹5 that Razorpay refunds). `POST
+  /api/subscription/mandate/verify` checks it replaces this workspace's current mandate (our `notes` on
+  it say what it replaces and does), cancels the old one and applies the change. Closing Checkout changes
+  nothing.
+- **Two mandates must never bill the same period.** An approved new mandate that can't be used is
+  cancelled, and the upgrade difference it charged is refunded: when Razorpay won't cancel the old one;
+  when the old one renewed (or is mid-charge) while the customer was in Checkout; when a later change
+  overtook it (an old Checkout approved late). The `subscription.*` webhook finishes an approved switch
+  too, since a customer approving in their UPI app may never return to the page. The same goes for
+  switching to autopay: if the next period was paid by payment link meanwhile, the mandate is cancelled.
+- Undoing a change re-schedules the plan the workspace is on, rather than
   just cancelling Razorpay's scheduled changes, because after a paid upgrade Razorpay's own plan is still
   the old one until the cycle ends. Autopay can't change period length: switch to manual first.
 - Past due: pay first. Cancelling: no changes.
@@ -241,10 +249,11 @@ subscriptions `subscription.authenticated`, `subscription.activated`, `subscript
 - Cache entitlements briefly (each API call reads the plan) once traffic grows.
 - Add-ons (e.g. "+5 members for ₹199/month"): recurring extras need a billing decision for autopay
   (Razorpay subscriptions have one fixed amount). Per-workspace overrides cover negotiated deals meanwhile.
-- Test plan changes on autopay against real Razorpay test mode, with both a card and a UPI mandate. For
-  UPI, check that Checkout charges the upgrade's add-on when the new mandate is approved.
-- Watch the logs for `refund it by hand`: a payment that arrived for a checkout the customer had
-  already replaced (e.g. paid in two tabs). The money is recorded on the invoice but not applied.
+- Test plan changes on autopay against real Razorpay test mode, with both a card and a UPI mandate, and
+  with the webhook reachable (e.g. a tunnel): approve a UPI change and close the tab before it returns.
+- Watch the logs for `by hand`: a payment that arrived for a checkout the customer had already replaced
+  (e.g. paid in two tabs; recorded on the invoice but not applied), or a mandate Razorpay wouldn't
+  cancel, or an upgrade difference to refund that only the webhook saw (it carries no payment id).
 - Set `CLIENT_ORIGIN` to the real app URL: payment links send the customer back there after paying.
 - Enable auto-capture in Dashboard → Payment Capture (otherwise `authorized` payments must be captured via API).
 - Switch to `rzp_live_` keys only on the server's environment; never ship the secret to the browser.

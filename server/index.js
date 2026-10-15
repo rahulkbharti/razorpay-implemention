@@ -12,7 +12,7 @@ import { payInvoiceByLink, payInvoiceByOrder, runBillingJob } from './manual.js'
 import { entitlementsRouter } from './entitlements.js';
 import { publicApiRouter, workspaceRouter } from './workspace.js';
 import { apiKeysRouter } from './apikeys.js';
-import { changesRouter } from './changes.js';
+import { adoptMandate, changesRouter } from './changes.js';
 import { HttpError, safeEqual } from './util.js';
 
 const {
@@ -69,7 +69,9 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       // webhook is the only place you learn about renewals, failed retries and cancellations.
       // If syncing throws, the 500 makes Razorpay retry the event later.
       if (event.event.startsWith('subscription.')) {
-        await syncRazorpaySubscription(event.payload.subscription.entity.id);
+        const id = event.payload.subscription.entity.id;
+        await adoptMandate(id, payment?.id);
+        await syncRazorpaySubscription(id);
       }
       break;
   }

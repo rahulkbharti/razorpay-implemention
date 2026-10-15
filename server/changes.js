@@ -12,7 +12,7 @@
 // invoices the next period like any manual one. Manual → autopay: the customer sets up a mandate
 // whose first charge is when the current period ends.
 import express from 'express';
-import { query } from './db.js';
+import { query, tx } from './db.js';
 import { findPrice, findSellablePrice, listFeatures, resolveEntitlements } from './catalog.js';
 import { requireRole, requireUser } from './auth.js';
 import { razorpay, signedByRazorpay } from './razorpay.js';
@@ -28,12 +28,13 @@ import {
   subscriptionView,
   tenantOverrides,
 } from './billing.js';
-import { openUpgradeInvoice, runBillingJob, voidOpenInvoices } from './manual.js';
+import { openUpgradeInvoice, runBillingJob, syncOpenLinks, voidOpenInvoices } from './manual.js';
 import { HttpError, toId } from './util.js';
 
 const MIN_CHARGE = 100; // Razorpay's minimum (₹1): a smaller prorated difference isn't charged
 const METHOD = { auto: 'Autopay', manual: 'Pay each time' };
 
+const unix = (time) => Math.floor(new Date(time).getTime() / 1000);
 const perMonth = (p) => (p.period === 'yearly' ? p.amount / 12 : p.amount);
 const isUpgrade = (live, price) => price.period === live.period && perMonth(price) > perMonth(live);
 
@@ -134,13 +135,15 @@ const INTENTS = ['switch_now', 'switch_at_period_end', 'revert'];
  * the difference in one Checkout. Nothing changes until that's done.
  */
 async function replaceMandate(s, price, { upfront = 0, intent }) {
+  const startAt = unix(s.current_period_end);
+  if (startAt <= Date.now() / 1000) throw new HttpError(409, RENEWING);
   const planId = await razorpayPlanFor(price).catch(razorpayError('Could not create the Razorpay plan'));
   const sub = await razorpay.subscriptions
     .create({
       plan_id: planId,
       total_count: TOTAL_COUNT[price.period],
       customer_notify: 1,
-      start_at: Math.floor(new Date(s.current_period_end).getTime() / 1000),
+      start_at: startAt,
       ...(upfront > 0 && {
         addons: [
           {
@@ -154,6 +157,7 @@ async function replaceMandate(s, price, { upfront = 0, intent }) {
         planKey: price.planKey,
         replaces: s.razorpay_subscription_id,
         intent,
+        upfront: String(upfront),
       },
     })
     .catch(razorpayError('Could not set up the new autopay'));
@@ -165,6 +169,129 @@ async function replaceMandate(s, price, { upfront = 0, intent }) {
     startsAt: s.current_period_end,
     upfront,
   };
+}
+
+const RENEWING = 'Your renewal is being charged right now — try again in a few minutes';
+const LIVE_MANDATE = ['authenticated', 'active'];
+
+/**
+ * Undoes a mandate the customer approved but that can't be used, so it never charges alongside
+ * the one in use: cancels it, and refunds the upgrade difference its approval charged. (Without
+ * one, approving charged Razorpay's ₹5 check, which Razorpay refunds itself.)
+ */
+async function undoMandate(rzp, paymentId) {
+  await razorpay.subscriptions
+    .cancel(rzp.id, false)
+    .catch((err) => console.error(`[billing] could not cancel ${rzp.id} — cancel it by hand`, err));
+  const upfront = Number(rzp.notes?.upfront) || 0;
+  if (!upfront) return;
+  if (!paymentId) return console.error(`[billing] ${rzp.id} was cancelled: refund its upfront ${upfront} by hand`);
+  await razorpay.payments
+    .refund(paymentId, { amount: upfront })
+    .catch((err) => console.error(`[billing] could not refund ${paymentId} — refund it by hand`, err));
+}
+
+/**
+ * Puts an approved replacement mandate (see replaceMandate) in place of the old one. Checkout's
+ * callback and the webhook both call this, since a customer approving in their UPI app may never
+ * come back to the page; whichever comes second finds it done. A mandate that can't be used any
+ * more is undone: one overtaken by a later change, or one whose old mandate has meanwhile charged
+ * the period it was meant to start, since both would bill that period. Returns the subscription id.
+ */
+async function finishReplacement(rzp, paymentId) {
+  const { tenantId, priceId, replaces, intent } = rzp.notes;
+  const undo = async (status, message) => {
+    await undoMandate(rzp, paymentId);
+    throw new HttpError(status, message);
+  };
+  const done = await tx(async (c) => {
+    await c.query(`SELECT pg_advisory_xact_lock(hashtext('mandate:' || $1))`, [tenantId]);
+    const s = await liveSubscription(toId(tenantId));
+    if (s?.razorpay_subscription_id === rzp.id) return { id: s.id, applied: false };
+    if (s?.collection_method !== 'auto' || s.razorpay_subscription_id !== replaces) {
+      await undo(409, 'This autopay was overtaken by another change, so it has been cancelled');
+    }
+    const old = await razorpay.subscriptions.fetch(replaces).catch(razorpayError('Could not fetch subscription'));
+    if (
+      !LIVE_MANDATE.includes(old.status) ||
+      (old.current_end ?? 0) > rzp.start_at ||
+      (old.charge_at ?? Infinity) <= Date.now() / 1000
+    ) {
+      await applyRazorpaySubscription(old); // our record may not have heard of the renewal yet
+      await undo(409, 'Your subscription renewed or changed in the meantime, so nothing was changed — please try again');
+    }
+
+    // Stop the old mandate: its current period is already paid, so nothing is lost.
+    try {
+      await razorpay.subscriptions.cancel(replaces, false);
+    } catch (err) {
+      console.error(err);
+      await undo(502, 'Could not stop the old autopay, so nothing was changed — please try again');
+    }
+    const price = await findPrice(toId(priceId));
+    await c.query(
+      `UPDATE subscriptions
+       SET razorpay_subscription_id = $2, updated_at = now(),
+           plan_id = CASE WHEN $3 = 'switch_now' THEN $4 ELSE plan_id END,
+           price_id = CASE WHEN $3 = 'switch_now' THEN $5 ELSE price_id END,
+           pending_plan_id = CASE WHEN $3 = 'switch_at_period_end' THEN $4 END,
+           pending_price_id = CASE WHEN $3 = 'switch_at_period_end' THEN $5 END,
+           pending_change_at = CASE WHEN $3 = 'switch_at_period_end' THEN current_period_end END
+       WHERE id = $1`,
+      [s.id, rzp.id, intent, price.planId, price.id]
+    );
+    return { id: s.id, applied: true };
+  });
+  if (done.applied) {
+    await voidOpenInvoices(done.id); // e.g. an unpaid upgrade charge from an earlier attempt
+    await applyRazorpaySubscription(rzp);
+  }
+  return done.id;
+}
+
+/**
+ * Puts an approved switch-to-autopay mandate in place (see /subscription/method); called like
+ * finishReplacement. The mandate starts where the period ended when it was set up, so if the
+ * customer paid the next period by payment link meanwhile, it would bill that period again: then
+ * it's undone. Returns the subscription id, or null if this isn't a switch to autopay.
+ */
+async function finishMethodSwitch(rzp, paymentId) {
+  const find = async () =>
+    (
+      await query(
+        `SELECT id, collection_method, current_period_end FROM subscriptions
+         WHERE razorpay_subscription_id = $1 AND status IN ('trialing', 'active')`,
+        [rzp.id]
+      )
+    ).rows[0];
+  let s = await find();
+  if (!s || s.collection_method === 'auto') return s?.id ?? null;
+  await syncOpenLinks(s.id).catch(razorpayError('Could not check the payment link'));
+  s = await find();
+  if (rzp.start_at < unix(s.current_period_end)) {
+    await undoMandate(rzp, paymentId);
+    throw new HttpError(409, "You've just paid for the next period, so autopay wasn't set up — switch again to start it after that");
+  }
+  await query(`UPDATE subscriptions SET collection_method = 'auto', updated_at = now() WHERE id = $1`, [s.id]);
+  await voidOpenInvoices(s.id); // the renewal's payment link isn't needed any more
+  await applyRazorpaySubscription(rzp);
+  return s.id;
+}
+
+/**
+ * For subscription.* webhooks, before the usual sync: a mandate approved in Checkout whose callback
+ * never reached us (tab closed, approved in the UPI app) is put in place here.
+ */
+export async function adoptMandate(razorpaySubscriptionId, paymentId) {
+  const rzp = await razorpay.subscriptions.fetch(razorpaySubscriptionId);
+  if (!LIVE_MANDATE.includes(rzp.status)) return;
+  try {
+    if (rzp.notes?.replaces && INTENTS.includes(rzp.notes.intent)) await finishReplacement(rzp, paymentId);
+    else await finishMethodSwitch(rzp, paymentId);
+  } catch (err) {
+    if (!(err instanceof HttpError) || err.status >= 500) throw err; // Razorpay retries the event
+    console.warn(`[webhook] ${razorpaySubscriptionId}: ${err.message}`);
+  }
 }
 
 const pendingSql = `UPDATE subscriptions
@@ -282,47 +409,15 @@ export function changesRouter() {
     if (!signedByRazorpay(`${razorpay_payment_id}|${razorpay_subscription_id}`, razorpay_signature)) {
       throw new HttpError(400, 'Invalid signature');
     }
-    const s = await live(req);
     const rzp = await razorpay.subscriptions.fetch(razorpay_subscription_id).catch(razorpayError('Could not fetch subscription'));
-    // Our notes say what it replaces and does; it must replace this workspace's current mandate.
-    const { tenantId, priceId, replaces, intent } = rzp.notes ?? {};
-    if (
-      s.collection_method !== 'auto' ||
-      tenantId !== String(req.tenant.id) ||
-      replaces !== s.razorpay_subscription_id ||
-      !INTENTS.includes(intent)
-    ) {
+    // Our notes say whose it is, what it replaces and what it does.
+    const { tenantId, replaces, intent } = rzp.notes ?? {};
+    if (tenantId !== String(req.tenant.id) || !replaces || !INTENTS.includes(intent)) {
       throw new HttpError(404, 'Subscription not found');
     }
-    if (!['authenticated', 'active'].includes(rzp.status)) throw new HttpError(400, `Mandate is ${rzp.status}`);
-    const price = await findPrice(toId(priceId));
-
-    // Stop the old mandate: its current period is already paid, so nothing is lost. If Razorpay
-    // won't, undo the new one instead, because two live mandates would both charge next cycle.
-    try {
-      await razorpay.subscriptions.cancel(replaces, false);
-    } catch (err) {
-      console.error(err);
-      await razorpay.subscriptions
-        .cancel(rzp.id, false)
-        .catch((e) => console.error(`[billing] could not undo ${rzp.id} either — cancel it by hand`, e));
-      throw new HttpError(502, 'Could not stop the old autopay, so nothing was changed — please try again');
-    }
-
-    await query(
-      `UPDATE subscriptions
-       SET razorpay_subscription_id = $2, updated_at = now(),
-           plan_id = CASE WHEN $3 = 'switch_now' THEN $4 ELSE plan_id END,
-           price_id = CASE WHEN $3 = 'switch_now' THEN $5 ELSE price_id END,
-           pending_plan_id = CASE WHEN $3 = 'switch_at_period_end' THEN $4 END,
-           pending_price_id = CASE WHEN $3 = 'switch_at_period_end' THEN $5 END,
-           pending_change_at = CASE WHEN $3 = 'switch_at_period_end' THEN current_period_end END
-       WHERE id = $1`,
-      [s.id, rzp.id, intent, price.planId, price.id]
-    );
-    await voidOpenInvoices(s.id); // e.g. an unpaid upgrade charge from an earlier attempt
-    await applyRazorpaySubscription(rzp);
-    res.json({ verified: true, subscription: await view(s.id) });
+    if (!LIVE_MANDATE.includes(rzp.status)) throw new HttpError(400, `Mandate is ${rzp.status}`);
+    const id = await finishReplacement(rzp, razorpay_payment_id);
+    res.json({ verified: true, subscription: await view(id) });
   });
 
   router.post('/subscription/method', ...billing, async (req, res) => {
@@ -340,6 +435,9 @@ export function changesRouter() {
       const rzp = await razorpay.subscriptions
         .fetch(s.razorpay_subscription_id)
         .catch(razorpayError('Could not fetch subscription'));
+      // Mid-charge, it's unclear which period the manual invoices should start from.
+      if ((rzp.charge_at ?? Infinity) <= Date.now() / 1000) throw new HttpError(409, RENEWING);
+      await applyRazorpaySubscription(rzp); // a renewal our record may not have heard of yet
       await razorpay.subscriptions
         .cancel(s.razorpay_subscription_id, rzp.status !== 'authenticated')
         .catch(razorpayError('Could not stop autopay'));
@@ -384,17 +482,13 @@ export function changesRouter() {
       throw new HttpError(400, 'Invalid signature');
     }
     const { rows } = await query(
-      `SELECT id FROM subscriptions WHERE razorpay_subscription_id = $1 AND tenant_id = $2 AND collection_method = 'manual'
-         AND status IN ('trialing', 'active')`,
+      `SELECT id FROM subscriptions WHERE razorpay_subscription_id = $1 AND tenant_id = $2 AND status IN ('trialing', 'active')`,
       [razorpay_subscription_id, req.tenant.id]
     );
     if (!rows[0]) throw new HttpError(404, 'Subscription not found');
     const sub = await razorpay.subscriptions.fetch(razorpay_subscription_id).catch(razorpayError('Could not fetch subscription'));
-    if (!['authenticated', 'active'].includes(sub.status)) throw new HttpError(400, `Mandate is ${sub.status}`);
-
-    await query(`UPDATE subscriptions SET collection_method = 'auto', updated_at = now() WHERE id = $1`, [rows[0].id]);
-    await voidOpenInvoices(rows[0].id); // the renewal's payment link isn't needed any more
-    await applyRazorpaySubscription(sub);
+    if (!LIVE_MANDATE.includes(sub.status)) throw new HttpError(400, `Mandate is ${sub.status}`);
+    await finishMethodSwitch(sub, razorpay_payment_id);
     res.json({ verified: true, subscription: await view(rows[0].id) });
   });
 
