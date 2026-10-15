@@ -24,7 +24,9 @@ Plans, what they include and what they cost live in PostgreSQL and are managed f
   no prices is free. The same price is used for autopay and manual payment. Each price becomes a Razorpay plan on its first subscribe. Razorpay plans can't be
   edited, so setting a new price retires the old row, and existing subscribers keep paying the old amount.
 - **Trials**: `trial_days` per plan (0 = none). It isn't an entitlement, so it can change on a published
-  version and only affects people who subscribe afterwards. A workspace gets one trial, ever.
+  version and only affects people who subscribe afterwards. The trial is for a workspace's first
+  subscription only: the customer can take it or pay now, and either way it's used up (so cancelling a
+  paid plan never earns a free trial).
 - **Overrides** (Admin → Tenants → Overrides): features and limits that differ from the plan for one
   workspace, e.g. a negotiated deal ("500 projects for Acme"). Stored on `tenants.overrides` in the same
   JSON shape, validated against the catalog, with a note saying why. Every value given replaces the
@@ -56,7 +58,9 @@ picks one on the pricing page (Autopay / Pay each time); the plan and price are 
 Statuses: `incomplete` (checkout not finished) → `trialing` → `active` → `past_due` → `halted` / `cancelled`
 / `expired`. `trialing`, `active` and `past_due` give the plan's features; anything else means the free plan.
 
-`POST /api/subscriptions` takes `{ priceId, method: 'auto' | 'manual' }`. Before it starts, any unfinished
+`POST /api/subscriptions` takes `{ priceId, method: 'auto' | 'manual', trial }`. It pays for the first period
+now; a trial the plan offers is only taken with `trial: true` (the pricing card's "Start 14-day free trial"
+link, under the main Subscribe button). Before it starts, any unfinished
 checkout, halted autopay subscription and unpaid invoice of the workspace is cancelled or voided, so none
 can come back to life next to the new one. `GET /api/subscription` returns the latest subscription with
 its payments, re-checking Razorpay first (so it's right even without webhooks, e.g. locally).

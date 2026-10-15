@@ -52,6 +52,18 @@ export const styles = {
     textDecoration: 'none',
   },
   textBtn: { background: 'none', border: 0, padding: 0, color: BRAND, fontSize: 'inherit', cursor: 'pointer' },
+  // A secondary action under a card's main button.
+  secondaryLinkBtn: (disabled) => ({
+    background: 'none',
+    border: 0,
+    padding: 0,
+    marginTop: 10,
+    color: BRAND,
+    fontSize: 14,
+    textDecoration: 'underline',
+    cursor: disabled ? 'default' : 'pointer',
+    opacity: disabled ? 0.5 : 1,
+  }),
   authCard: { border: '1px solid #dee2e6', borderRadius: 12, padding: 24, maxWidth: 420, margin: '0 auto' },
   stack: { display: 'flex', flexDirection: 'column', gap: 12, marginTop: 16 },
   page: { fontFamily: 'system-ui, sans-serif', maxWidth: 720, margin: '32px auto', padding: '0 16px', color: '#212529' },

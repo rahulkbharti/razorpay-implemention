@@ -78,13 +78,14 @@ export async function tenantOverrides(tenantId) {
   return rows[0]?.overrides;
 }
 
-// One free trial per workspace. A checkout that was never finished doesn't use it up.
-async function trialUsed(tenantId) {
-  const { rows } = await query(
-    `SELECT 1 FROM subscriptions WHERE tenant_id = $1 AND trial_end IS NOT NULL AND status <> 'incomplete'`,
-    [tenantId]
-  );
-  return rows.length > 0;
+// A free trial is for a workspace's first subscription only: one that had a trial, or paid
+// without one, uses it up (else cancelling a paid plan would earn a free trial). A checkout that
+// was never finished doesn't.
+async function trialAvailable(tenantId) {
+  const { rows } = await query(`SELECT 1 FROM subscriptions WHERE tenant_id = $1 AND status <> 'incomplete' LIMIT 1`, [
+    tenantId,
+  ]);
+  return rows.length === 0;
 }
 
 /* ---------- Subscriptions ---------- */
@@ -315,8 +316,8 @@ export function billingRouter() {
   const router = express.Router();
 
   router.get('/me', requireUser, async (req, res) => {
-    const [plan, usedTrial] = await Promise.all([currentPlan(req.tenant.id), trialUsed(req.tenant.id)]);
-    res.json({ user: req.user, tenant: req.tenant, plan, trialAvailable: !usedTrial });
+    const [plan, canTrial] = await Promise.all([currentPlan(req.tenant.id), trialAvailable(req.tenant.id)]);
+    res.json({ user: req.user, tenant: req.tenant, plan, trialAvailable: canTrial });
   });
 
   // The workspace's latest subscription, live or ended (null if it never had one).
@@ -341,17 +342,19 @@ export function billingRouter() {
 
   // Starts a subscription. method 'auto' (default): Razorpay Subscription → Checkout authorises the
   // mandate (and pays the first cycle unless there's a trial). method 'manual': a trial starts right
-  // away, or the first period is paid in Checkout with an order.
+  // away, or the first period is paid in Checkout with an order. A trial the plan offers is only
+  // taken with trial: true; paying now instead uses up the workspace's trial.
   router.post('/subscriptions', requireUser, requireRole('owner', 'admin'), async (req, res) => {
     const priceId = toId(req.body?.priceId);
     const method = req.body?.method === 'manual' ? 'manual' : 'auto';
+    const wantsTrial = req.body?.trial === true;
     const price = priceId && (await findSellablePrice(priceId));
     if (!price) throw new HttpError(400, 'Unknown plan');
     const tenantId = req.tenant.id;
     if (await liveSubscription(tenantId)) {
       throw new HttpError(409, 'This workspace already has an active subscription — cancel it first');
     }
-    const trialDays = price.trialDays > 0 && !(await trialUsed(tenantId)) ? price.trialDays : 0;
+    const trialDays = wantsTrial && price.trialDays > 0 && (await trialAvailable(tenantId)) ? price.trialDays : 0;
     await clearStale(tenantId);
     const summary = { method, name: price.planName, amount: price.amount, currency: price.currency, period: price.period, trialDays };
 

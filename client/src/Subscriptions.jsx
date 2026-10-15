@@ -52,7 +52,7 @@ export default function Subscriptions({ config, me, onChange }) {
 
   const checkoutOptions = (description) => ({
     key: config.keyId,
-    name: 'My SaaS',
+    name: 'Libspace',
     description,
     prefill: { name: me.user.name, email: me.user.email, contact: me.user.phone ?? undefined },
     theme: { color: '#3b5bdb' },
@@ -76,9 +76,10 @@ export default function Subscriptions({ config, me, onChange }) {
     }
   }
 
-  function subscribe(priceId) {
-    run(priceId, async () => {
-      const s = await api('/api/subscriptions', { priceId, method });
+  // Pays for the first period now, or with trial: true starts the free trial the plan offers.
+  function subscribe(priceId, { trial = false } = {}) {
+    run(trial ? `${priceId}-trial` : priceId, async () => {
+      const s = await api('/api/subscriptions', { priceId, method, trial });
       const checkout = checkoutOptions(`${s.name} — ${rupees(s.amount)} / ${PER[s.period]}`);
 
       if (s.method === 'auto') {
@@ -258,7 +259,7 @@ export default function Subscriptions({ config, me, onChange }) {
           if (!live) {
             const current = p.key === currentKey;
             disabled = !!busy || !p.price || current || !canBill;
-            label = current ? 'Current plan' : !p.price ? 'Free forever' : trial ? `Start ${trial}-day free trial` : 'Subscribe';
+            label = current ? 'Current plan' : !p.price ? 'Free forever' : 'Subscribe';
           } else {
             const current = p.price?.id === sub.priceId;
             const scheduled = p.price && sub.pendingChange?.priceId === p.price.id;
@@ -287,11 +288,20 @@ export default function Subscriptions({ config, me, onChange }) {
                 {label}
               </button>
               {trial > 0 && (
-                <p style={{ ...styles.muted, fontSize: 13 }}>
-                  {method === 'auto'
-                    ? `Set up autopay now; the first charge is after ${trial} days.`
-                    : `Nothing to pay now. We'll send a payment link before the trial ends.`}
-                </p>
+                <>
+                  <button
+                    style={styles.secondaryLinkBtn(disabled)}
+                    disabled={disabled}
+                    onClick={() => subscribe(p.price.id, { trial: true })}
+                  >
+                    {busy === `${p.price.id}-trial` ? 'Processing…' : `Start ${trial}-day free trial`}
+                  </button>
+                  <p style={{ ...styles.muted, fontSize: 13 }}>
+                    {method === 'auto'
+                      ? `Set up autopay now; the first charge is after ${trial} days.`
+                      : `Nothing to pay now. We'll send a payment link before the trial ends.`}
+                  </p>
+                </>
               )}
               <ul style={styles.featureList}>
                 {p.features.map((f) => (
